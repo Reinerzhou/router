@@ -403,6 +403,30 @@ impl ConfigValidator {
                     Self::validate_policy(d_policy)?;
                 }
             }
+            RoutingMode::LMDeployPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+                migration_protocol: _,
+                rdma_config: _,
+                dummy_prefill: _,
+            } => {
+                // Empty URL lists are valid: LMDeploy API servers can register
+                // later through the native-compatible /nodes/add endpoint.
+                if !prefill_urls.is_empty() {
+                    Self::validate_urls(prefill_urls)?;
+                }
+                if !decode_urls.is_empty() {
+                    Self::validate_urls(decode_urls)?;
+                }
+                if let Some(p_policy) = prefill_policy {
+                    Self::validate_policy(p_policy)?;
+                }
+                if let Some(d_policy) = decode_policy {
+                    Self::validate_policy(d_policy)?;
+                }
+            }
             RoutingMode::OpenAI { worker_urls } => {
                 // Require exactly one worker URL for OpenAI router
                 if worker_urls.len() != 1 {
@@ -609,6 +633,13 @@ impl ConfigValidator {
                 if discovery.prefill_selector.is_empty() && discovery.decode_selector.is_empty() {
                     return Err(ConfigError::ValidationFailed {
                         reason: "vLLM PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
+                    });
+                }
+            }
+            RoutingMode::LMDeployPrefillDecode { .. } => {
+                if discovery.prefill_selector.is_empty() && discovery.decode_selector.is_empty() {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "LMDeploy PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
                     });
                 }
             }
@@ -834,7 +865,9 @@ impl ConfigValidator {
             // Check if power-of-two policy makes sense with insufficient workers
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
-                if worker_count < 2 {
+                // Zero workers is dynamic-registration mode. Validate once
+                // static workers have actually been supplied.
+                if worker_count != 0 && worker_count < 2 {
                     return Err(ConfigError::IncompatibleConfig {
                         reason: "Power-of-two policy requires at least 2 workers".to_string(),
                     });
@@ -852,7 +885,7 @@ impl ConfigValidator {
             {
                 // Check power-of-two for prefill
                 if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
-                    if prefill_urls.len() < 2 {
+                    if !prefill_urls.is_empty() && prefill_urls.len() < 2 {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: "Power-of-two policy for prefill requires at least 2 prefill workers".to_string(),
                         });
@@ -861,7 +894,37 @@ impl ConfigValidator {
 
                 // Check power-of-two for decode
                 if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
-                    if decode_urls.len() < 2 {
+                    if !decode_urls.is_empty() && decode_urls.len() < 2 {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason:
+                                "Power-of-two policy for decode requires at least 2 decode workers"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
+
+            // For LMDeploy PD mode, validate that policies have sufficient workers
+            if let RoutingMode::LMDeployPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+                dummy_prefill,
+                ..
+            } = &config.mode
+            {
+                if !dummy_prefill {
+                    if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
+                        if !prefill_urls.is_empty() && prefill_urls.len() < 2 {
+                            return Err(ConfigError::IncompatibleConfig {
+                                reason: "Power-of-two policy for prefill requires at least 2 prefill workers".to_string(),
+                            });
+                        }
+                    }
+                }
+                if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
+                    if !decode_urls.is_empty() && decode_urls.len() < 2 {
                         return Err(ConfigError::IncompatibleConfig {
                             reason:
                                 "Power-of-two policy for decode requires at least 2 decode workers"

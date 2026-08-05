@@ -13,6 +13,10 @@ crate-type = ["cdylib", "rlib"]
 name = "vllm-router"
 path = "src/main.rs"
 
+[[bin]]
+name = "lmdeploy-router"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
@@ -34,7 +38,7 @@ rand = "0.9.2"
 reqwest = { version = "0.13", features = ["stream", "blocking", "json"] }
 futures-util = "0.3"
 futures = "0.3"
-pyo3 = { version = "0.26", features = ["extension-module"] }
+pyo3 = { version = "0.26", features = ["extension-module"], optional = true }
 dashmap = "6.1.0"
 http = "1.1.0"
 mime = "0.3"
@@ -113,6 +117,8 @@ vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0"
 vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
 
 [features]
+default = ["python"]
+python = ["dep:pyo3"]
 # Every Rust test file is gated on these. `cargo test` compiles a group
 # only when its features are passed, for example `--features cpu,ready`.
 cpu = []
@@ -334,6 +340,7 @@ path = "tests/rust/tokenizer_integration.rs"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = true
 
 [profile.dev]
 opt-level = 0
@@ -345,6 +352,7 @@ incremental = true
 [profile.dev.build-override]
 opt-level = 3
 codegen-units = 1
+strip = true
 
 [profile.dev-opt]
 inherits = "dev"

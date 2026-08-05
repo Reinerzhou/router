@@ -28,6 +28,9 @@ target
 # Python virtual environment
 .venv/
 
+# Local integration-test artifacts
+.test-artifacts/
+
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/

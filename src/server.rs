@@ -29,10 +29,10 @@ use axum::{
     Json, Router,
 };
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -41,7 +41,7 @@ use std::{
 use tokio::{
     net::{TcpListener, TcpStream},
     signal, spawn,
-    sync::RwLock,
+    sync::{Mutex, RwLock},
 };
 use tracing::{error, info, warn, Level};
 
@@ -56,6 +56,7 @@ pub struct AppContext {
     pub response_storage: SharedResponseStorage,
     pub api_key_cache: Arc<RwLock<HashMap<String, bool>>>,
     pub api_key_validation_urls: Arc<Vec<String>>,
+    pub(crate) lmdeploy_nodes: Arc<Mutex<HashMap<String, LMDeployNodeStatus>>>,
 }
 
 impl AppContext {
@@ -104,8 +105,52 @@ impl AppContext {
             response_storage,
             api_key_cache: Arc::new(RwLock::new(HashMap::new())),
             api_key_validation_urls: Arc::new(api_key_validation_urls),
+            lmdeploy_nodes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
+}
+
+const LMDEPLOY_ROLE_HYBRID: u8 = 1;
+const LMDEPLOY_ROLE_PREFILL: u8 = 2;
+const LMDEPLOY_ROLE_DECODE: u8 = 3;
+
+fn default_lmdeploy_role() -> u8 {
+    LMDEPLOY_ROLE_HYBRID
+}
+
+/// Wire-compatible with lmdeploy.serve.proxy.proxy.Status.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct LMDeployNodeStatus {
+    #[serde(default = "default_lmdeploy_role")]
+    role: u8,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    unfinished: usize,
+    #[serde(default)]
+    latency: VecDeque<f64>,
+    #[serde(default)]
+    speed: Option<i64>,
+}
+
+impl Default for LMDeployNodeStatus {
+    fn default() -> Self {
+        Self {
+            role: LMDEPLOY_ROLE_HYBRID,
+            models: Vec::new(),
+            unfinished: 0,
+            latency: VecDeque::new(),
+            speed: None,
+        }
+    }
+}
+
+/// Wire-compatible with lmdeploy.serve.proxy.proxy.Node.
+#[derive(Debug, Deserialize)]
+struct LMDeployNode {
+    url: String,
+    #[serde(default)]
+    status: Option<LMDeployNodeStatus>,
 }
 
 #[derive(Clone)]
@@ -539,6 +584,203 @@ async fn authorize_request(
     }
 }
 
+fn validate_lmdeploy_role_for_router(state: &AppState, role: u8) -> Result<(), String> {
+    if state
+        .router
+        .as_any()
+        .is::<crate::routers::http::lmdeploy_pd_router::LMDeployPDRouter>()
+    {
+        return match role {
+            LMDEPLOY_ROLE_PREFILL | LMDEPLOY_ROLE_DECODE => Ok(()),
+            LMDEPLOY_ROLE_HYBRID => Err(
+                "LMDeploy PD mode accepts only Prefill (2) or Decode (3) registrations".to_string(),
+            ),
+            _ => Err(format!(
+                "Invalid LMDeploy engine role {role}; expected Hybrid=1, Prefill=2, or Decode=3"
+            )),
+        };
+    }
+
+    if state
+        .router
+        .as_any()
+        .is::<crate::routers::http::router::Router>()
+    {
+        return match role {
+            LMDEPLOY_ROLE_HYBRID => Ok(()),
+            LMDEPLOY_ROLE_PREFILL | LMDEPLOY_ROLE_DECODE => {
+                Err("Regular mode accepts only Hybrid (1) LMDeploy registrations".to_string())
+            }
+            _ => Err(format!(
+                "Invalid LMDeploy engine role {role}; expected Hybrid=1, Prefill=2, or Decode=3"
+            )),
+        };
+    }
+
+    Err("LMDeploy node registration is supported only in regular or LMDeploy PD mode".to_string())
+}
+
+fn registered_lmdeploy_role(state: &AppState, node_url: &str) -> Option<u8> {
+    let dp_prefix = format!("{}@", node_url);
+    state
+        .context
+        .worker_registry
+        .get_all()
+        .into_iter()
+        .find(|worker| worker.url() == node_url || worker.url().starts_with(&dp_prefix))
+        .map(|worker| match worker.worker_type() {
+            WorkerType::Regular => LMDEPLOY_ROLE_HYBRID,
+            WorkerType::Prefill { .. } => LMDEPLOY_ROLE_PREFILL,
+            WorkerType::Decode => LMDEPLOY_ROLE_DECODE,
+        })
+}
+
+fn register_lmdeploy_worker_unchecked(
+    state: &AppState,
+    node_url: &str,
+    role: u8,
+) -> Result<(), String> {
+    validate_lmdeploy_role_for_router(state, role)?;
+
+    if let Some(router) = state
+        .router
+        .as_any()
+        .downcast_ref::<crate::routers::http::lmdeploy_pd_router::LMDeployPDRouter>(
+    ) {
+        return match role {
+            LMDEPLOY_ROLE_PREFILL => router
+                .register_prefill_server_unchecked(node_url.to_string())
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            LMDEPLOY_ROLE_DECODE => router
+                .register_decode_server_unchecked(node_url.to_string())
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            _ => unreachable!("role was validated above"),
+        };
+    }
+
+    let router = state
+        .router
+        .as_any()
+        .downcast_ref::<crate::routers::http::router::Router>()
+        .expect("regular router type was validated above");
+    router.register_worker_unchecked(node_url).map(|_| ())
+}
+
+async fn remove_lmdeploy_worker(state: &AppState, node_url: &str, role: u8) -> Result<(), String> {
+    validate_lmdeploy_role_for_router(state, role)?;
+
+    if let Some(router) = state
+        .router
+        .as_any()
+        .downcast_ref::<crate::routers::http::lmdeploy_pd_router::LMDeployPDRouter>(
+    ) {
+        return match role {
+            LMDEPLOY_ROLE_PREFILL => router
+                .remove_prefill_server(node_url)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            LMDEPLOY_ROLE_DECODE => router
+                .remove_decode_server(node_url)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            _ => unreachable!("role was validated above"),
+        };
+    }
+
+    let router = state
+        .router
+        .as_any()
+        .downcast_ref::<crate::routers::http::router::Router>()
+        .expect("regular router type was validated above");
+    router.remove_worker(node_url);
+    Ok(())
+}
+
+/// LMDeploy-compatible dynamic registration endpoint. This endpoint is
+/// intentionally unauthenticated: `lmdeploy serve api_server --proxy-url`
+/// does not send an Authorization header.
+async fn add_lmdeploy_node(
+    State(state): State<Arc<AppState>>,
+    Json(node): Json<LMDeployNode>,
+) -> Response {
+    if node.url.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json("Failed to add, please check the input url."),
+        )
+            .into_response();
+    }
+
+    let status = node.status.unwrap_or_default();
+    if let Err(error) = validate_lmdeploy_role_for_router(&state, status.role) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+
+    // Serialize registration/removal for a URL. This also makes repeated
+    // startup registration idempotent instead of surfacing WorkerAlreadyExists.
+    let mut nodes = state.context.lmdeploy_nodes.lock().await;
+    let current_role = registered_lmdeploy_role(&state, &node.url);
+
+    if let Some(old_role) = current_role {
+        if old_role != status.role {
+            if let Err(error) = remove_lmdeploy_worker(&state, &node.url, old_role).await {
+                return (StatusCode::BAD_REQUEST, error).into_response();
+            }
+            if let Err(error) = register_lmdeploy_worker_unchecked(&state, &node.url, status.role) {
+                let rollback = register_lmdeploy_worker_unchecked(&state, &node.url, old_role);
+                let message = match rollback {
+                    Ok(()) => error,
+                    Err(rollback_error) => {
+                        format!("{error}; failed to restore previous role: {rollback_error}")
+                    }
+                };
+                return (StatusCode::BAD_REQUEST, message).into_response();
+            }
+        }
+    } else if let Err(error) = register_lmdeploy_worker_unchecked(&state, &node.url, status.role) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+
+    info!(
+        "LMDeploy node registered: url={}, role={}, models={:?}",
+        node.url, status.role, status.models
+    );
+    nodes.insert(node.url, status);
+    Json("Added successfully").into_response()
+}
+
+async fn remove_lmdeploy_node(
+    State(state): State<Arc<AppState>>,
+    Json(node): Json<LMDeployNode>,
+) -> Response {
+    let mut nodes = state.context.lmdeploy_nodes.lock().await;
+    let role = registered_lmdeploy_role(&state, &node.url)
+        .or_else(|| nodes.get(&node.url).map(|status| status.role))
+        .or_else(|| node.status.map(|status| status.role));
+
+    if let Some(role) = role {
+        // Native LMDeploy treats removal as idempotent. A missing worker can
+        // race with health-based/manual removal, so it is still a success.
+        if let Err(error) = remove_lmdeploy_worker(&state, &node.url, role).await {
+            if registered_lmdeploy_role(&state, &node.url).is_some() {
+                return (StatusCode::BAD_REQUEST, error).into_response();
+            }
+        }
+    }
+
+    nodes.remove(&node.url);
+    info!("LMDeploy node removed: url={}", node.url);
+    Json("Deleted successfully").into_response()
+}
+
+async fn lmdeploy_node_status(State(state): State<Arc<AppState>>) -> Response {
+    Json(state.context.lmdeploy_nodes.lock().await.clone()).into_response()
+}
+
 async fn add_worker(
     State(state): State<Arc<AppState>>,
     Query(UrlQuery { url }): Query<UrlQuery>,
@@ -925,7 +1167,10 @@ pub fn build_app_with_wasm_middleware(
         .route("/health_generate", get(health_generate))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
-        .route("/get_server_info", get(get_server_info));
+        .route("/get_server_info", get(get_server_info))
+        .route("/nodes/status", get(lmdeploy_node_status))
+        .route("/nodes/add", post(add_lmdeploy_node))
+        .route("/nodes/remove", post(remove_lmdeploy_node));
 
     let admin_routes = Router::new()
         .route("/add_worker", post(add_worker))

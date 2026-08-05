@@ -620,8 +620,28 @@ impl CompletionCountProvider for ChatCompletionRequest {
 impl ChatCompletionRequest {
     /// Validate message-specific requirements
     pub fn validate_messages(&self) -> Result<(), ValidationError> {
-        // Ensure messages array is not empty
-        utils::validate_non_empty_array(&self.messages, "messages")?;
+        // LMDeploy token-in-token-out requests use an empty messages array and
+        // carry the active prompt in `input_ids`.
+        if self.messages.is_empty() {
+            return match self.input_ids.as_ref() {
+                Some(ids) if !ids.is_empty() => Ok(()),
+                Some(_) => Err(ValidationError::InvalidValue {
+                    parameter: "input_ids".to_string(),
+                    value: "empty array".to_string(),
+                    reason: "input_ids cannot be empty when messages is empty".to_string(),
+                }),
+                None => utils::validate_non_empty_array(&self.messages, "messages"),
+            };
+        }
+
+        // LMDeploy gives messages priority and rejects simultaneous token input.
+        if self.input_ids.is_some() {
+            return Err(ValidationError::InvalidValue {
+                parameter: "input_ids".to_string(),
+                value: "set with non-empty messages".to_string(),
+                reason: "input_ids cannot be used when messages is non-empty".to_string(),
+            });
+        }
 
         // Validate message content is not empty
         for (i, msg) in self.messages.iter().enumerate() {
@@ -889,6 +909,7 @@ mod tests {
                     content: UserMessageContent::Text("Hello".to_string()),
                     name: None,
                 }],
+                input_ids: None,
                 temperature: Some(1.0),
                 top_p: Some(0.9),
                 n: Some(1),
@@ -950,6 +971,24 @@ mod tests {
             // Invalid temperature
             let mut request = create_valid_chat_request();
             request.temperature = Some(3.0);
+            assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_chat_validation_accepts_lmdeploy_token_input() {
+            let mut request = create_valid_chat_request();
+            request.messages = vec![];
+            request.input_ids = Some(vec![1, 2, 3]);
+            assert!(request.validate().is_ok());
+
+            request.input_ids = Some(vec![]);
+            assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_chat_validation_rejects_messages_with_lmdeploy_token_input() {
+            let mut request = create_valid_chat_request();
+            request.input_ids = Some(vec![1, 2, 3]);
             assert!(request.validate().is_err());
         }
 

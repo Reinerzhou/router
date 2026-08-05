@@ -454,6 +454,126 @@ fn build_dp_workers(
 }
 
 impl PdRouterBase {
+    pub fn register_decode_server_unchecked(&self, url: String) -> Result<String, PDRouterError> {
+        if self.dp_size > 1 {
+            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            if dp_rank.is_some() {
+                // URL already has @rank suffix — single DPAwareWorker
+                if self.worker_registry.get_by_url(&url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+                let worker_arc: Arc<dyn Worker> = Arc::new(
+                    DPAwareWorker::new(
+                        base_url,
+                        dp_rank.unwrap_or(0),
+                        self.dp_size,
+                        WorkerType::Decode,
+                    )
+                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                );
+                self.register_and_notify(worker_arc);
+                info!("Added decode server: {}", url);
+            } else {
+                // Bare URL — expand into dp_size workers (same as add_prefill_server)
+                let first_dp_url = format!("{}@0", url);
+                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                for rank in 0..self.dp_size {
+                    let dp_url = format!("{}@{}", url, rank);
+                    let worker_arc: Arc<dyn Worker> = Arc::new(
+                        DPAwareWorker::new(url.clone(), rank, self.dp_size, WorkerType::Decode)
+                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                    );
+                    self.register_and_notify(worker_arc);
+                    info!("Added decode server: {} (rank {})", dp_url, rank);
+                }
+                info!(
+                    "Expanded decode server {} into {} DP-aware workers",
+                    url, self.dp_size
+                );
+            }
+        } else {
+            if self.worker_registry.get_by_url(&url).is_some() {
+                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+            }
+            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_decode_with_config(
+                url.clone(),
+                self.circuit_breaker_config.clone(),
+            ));
+            self.register_and_notify(worker_arc);
+            info!("Added decode server: {}", url);
+        }
+
+        Ok(format!("Successfully added decode server: {}", url))
+    }
+
+    pub fn register_prefill_server_unchecked(
+        &self,
+        url: String,
+        bootstrap_port: Option<u16>,
+    ) -> Result<String, PDRouterError> {
+        let worker_type = WorkerType::Prefill { bootstrap_port };
+
+        if self.dp_size > 1 {
+            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            if dp_rank.is_some() {
+                // URL already has @rank suffix (e.g., from direct URL mode).
+                // Create a single DPAwareWorker. DPAwareWorker strips the @rank
+                // suffix in endpoint_url(), preventing IPv6+DP URL corruption
+                // where HTTP clients interpret @N as a userinfo separator per RFC 3986.
+                if self.worker_registry.get_by_url(&url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+                let worker_arc: Arc<dyn Worker> = Arc::new(
+                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, worker_type)
+                        .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                );
+                self.register_and_notify(worker_arc);
+                info!("Added prefill server: {}", url);
+            } else {
+                // Bare URL without @rank (e.g., from K8s service discovery).
+                // Expand into dp_size workers, one per DP rank, matching the
+                // expansion logic in router.rs::add_worker() and PdRouterBase::new().
+                // Without this, all traffic pins to rank 0 via unwrap_or(0),
+                // bypassing vLLM's hybrid load balancer.
+                let first_dp_url = format!("{}@0", url);
+                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                for rank in 0..self.dp_size {
+                    let dp_url = format!("{}@{}", url, rank);
+                    let worker_arc: Arc<dyn Worker> = Arc::new(
+                        DPAwareWorker::new(url.clone(), rank, self.dp_size, worker_type.clone())
+                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                    );
+                    self.register_and_notify(worker_arc);
+                    info!("Added prefill server: {} (rank {})", dp_url, rank);
+                }
+                info!(
+                    "Expanded prefill server {} into {} DP-aware workers",
+                    url, self.dp_size
+                );
+            }
+        } else {
+            // dp_size == 1: no DP-aware routing, use BasicWorker
+            if self.worker_registry.get_by_url(&url).is_some() {
+                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+            }
+            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_prefill_with_config(
+                url.clone(),
+                bootstrap_port,
+                self.circuit_breaker_config.clone(),
+            ));
+            self.register_and_notify(worker_arc);
+            info!("Added prefill server: {}", url);
+        }
+
+        Ok(format!("Successfully added prefill server: {}", url))
+    }
+
     /// `router_prompts` are the router's token ids for `grpc://` pools. HTTP
     /// pools pass `None` and each backend renders the request itself.
     pub(super) async fn prepare_prefill_inputs(

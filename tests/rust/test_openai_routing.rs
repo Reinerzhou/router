@@ -202,6 +202,7 @@ async fn test_unsupported_endpoints() {
         session_params: None,
         return_hidden_states: false,
         rid: None,
+        other: serde_json::Map::new(),
     };
 
     let response = router.route_generate(None, &generate_request, None).await;

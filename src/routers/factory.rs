@@ -1,7 +1,10 @@
 //! Factory for creating router instances
 
 use super::{
-    http::{openai_router::OpenAIRouter, router::Router, vllm_pd_router::VllmPDRouter},
+    http::{
+        lmdeploy_pd_router::LMDeployPDRouter, openai_router::OpenAIRouter, router::Router,
+        vllm_pd_router::VllmPDRouter,
+    },
     RouterTrait,
 };
 use crate::config::{PolicyConfig, RoutingMode};
@@ -32,6 +35,32 @@ impl RouterFactory {
                     prefill_urls,
                     decode_urls,
                     discovery_address.clone(),
+                    prefill_policy.as_ref(),
+                    decode_policy.as_ref(),
+                    &ctx.router_config.policy,
+                    ctx,
+                )
+                .await
+            }
+            RoutingMode::LMDeployPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+                migration_protocol,
+                rdma_config,
+                dummy_prefill,
+            } => {
+                tracing::info!(
+                    "Creating LMDeployPDRouter with prefill_urls: {:?}, decode_urls: {:?}, migration_protocol: {:?}",
+                    prefill_urls, decode_urls, migration_protocol
+                );
+                Self::create_lmdeploy_pd_router(
+                    prefill_urls,
+                    decode_urls,
+                    *migration_protocol,
+                    rdma_config.clone(),
+                    *dummy_prefill,
                     prefill_policy.as_ref(),
                     decode_policy.as_ref(),
                     &ctx.router_config.policy,
@@ -106,6 +135,46 @@ impl RouterFactory {
         )
         .await?;
         tracing::info!("VllmPDRouter instance created successfully");
+
+        Ok(Box::new(router))
+    }
+
+    /// Create an LMD (lmdeploy) PD router with static URLs
+    pub async fn create_lmdeploy_pd_router(
+        prefill_urls: &[String],
+        decode_urls: &[String],
+        migration_protocol: crate::config::LMDeployMigrationProtocol,
+        rdma_config: Option<crate::config::LMDeployRdmaConfig>,
+        dummy_prefill: bool,
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        let prefill_policy =
+            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
+        let decode_policy =
+            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+
+        ctx.policy_registry.set_prefill_policy(prefill_policy);
+        ctx.policy_registry.set_decode_policy(decode_policy);
+
+        tracing::info!(
+            "Creating LMDeployPDRouter with static URLs - prefill: {:?}, decode: {:?}",
+            prefill_urls,
+            decode_urls
+        );
+
+        let router = LMDeployPDRouter::new(
+            prefill_urls.to_vec(),
+            decode_urls.to_vec(),
+            migration_protocol,
+            rdma_config,
+            dummy_prefill,
+            ctx,
+        )
+        .await?;
+        tracing::info!("LMDeployPDRouter instance created successfully");
 
         Ok(Box::new(router))
     }

@@ -471,7 +471,9 @@ async fn handle_pod_event(
 
             // Handle PD mode with specific pod types
             let result = if pd_mode && pod_info.pod_type.is_some() {
-                use crate::routers::http::vllm_pd_router::VllmPDRouter;
+                use crate::routers::http::{
+                    lmdeploy_pd_router::LMDeployPDRouter, vllm_pd_router::VllmPDRouter,
+                };
 
                 if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
                     // Support --vllm-pd-disaggregation mode with K8s service discovery
@@ -489,8 +491,22 @@ async fn handle_pod_event(
                             router.add_worker(&worker_url).await
                         }
                     }
+                } else if let Some(lmdeploy_pd_router) =
+                    router.as_any().downcast_ref::<LMDeployPDRouter>()
+                {
+                    match &pod_info.pod_type {
+                        Some(PodType::Prefill) => lmdeploy_pd_router
+                            .add_prefill_server(worker_url.clone())
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Some(PodType::Decode) => lmdeploy_pd_router
+                            .add_decode_server(worker_url.clone())
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Some(PodType::Regular) | None => router.add_worker(&worker_url).await,
+                    }
                 } else {
-                    Err("PD mode enabled but router is not a VllmPDRouter".to_string())
+                    Err("PD mode enabled but router is not a supported PD router".to_string())
                 }
             } else {
                 // Regular mode or no pod type specified
@@ -717,6 +733,7 @@ mod tests {
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
             api_key_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             api_key_validation_urls: Arc::new(Vec::new()),
+            lmdeploy_nodes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         });
 
         let router = Router::new(vec![], &app_context).await.unwrap();

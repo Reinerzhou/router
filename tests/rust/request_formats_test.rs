@@ -102,6 +102,10 @@ impl TestContext {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod request_format_tests {
     use super::*;
+    use axum::body::to_bytes;
+    use vllm_router_rs::protocols::spec::{
+        ChatCompletionRequest, GenerateRequest, GenerateResponse,
+    };
 
     #[tokio::test]
     async fn test_generate_request_formats() {
@@ -149,6 +153,54 @@ mod request_format_tests {
 
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_lmdeploy_token_io_survives_router_http_path() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let chat_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [],
+            "input_ids": [151644, 8948, 198],
+            "do_preprocess": false,
+            "return_token_ids": true,
+            "stream": false
+        }))
+        .unwrap();
+        let chat_response = ctx.router.route_chat(None, &chat_request, None).await;
+        assert!(chat_response.status().is_success());
+        let chat_body = to_bytes(chat_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let chat_json: serde_json::Value = serde_json::from_slice(&chat_body).unwrap();
+        assert_eq!(chat_json["choices"][0]["output_ids"], json!([9001, 9002]));
+
+        let generate_request: GenerateRequest = serde_json::from_value(json!({
+            "input_ids": [151644, 8948, 198],
+            "max_tokens": 8,
+            "stream": false
+        }))
+        .unwrap();
+        let generate_response = ctx
+            .router
+            .route_generate(None, &generate_request, None)
+            .await;
+        assert!(generate_response.status().is_success());
+        let generate_body = to_bytes(generate_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let generate: GenerateResponse = serde_json::from_slice(&generate_body).unwrap();
+        assert_eq!(generate.output_ids, vec![9001, 9002]);
 
         ctx.shutdown().await;
     }

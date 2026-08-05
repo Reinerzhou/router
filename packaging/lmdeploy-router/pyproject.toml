@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "lmdeploy-router"
+version = "0.0.1"
+description = "High-performance Rust router for LMDeploy"
+requires-python = ">=3.10,<3.13"
+license = "Apache-2.0"
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+]
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "../../Cargo.toml"
+locked = true
+no-default-features = true
+strip = true
+compatibility = "manylinux2014"

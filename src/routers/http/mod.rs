@@ -4,6 +4,7 @@ mod completion_output;
 mod completion_route;
 pub mod dp_utils;
 mod epd;
+pub mod lmdeploy_pd_router;
 pub mod logprobs_merge;
 pub mod openai_router;
 mod pd_cached_tokens;

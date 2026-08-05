@@ -885,6 +885,59 @@ pub enum KvConnector {
     MoriIO,
 }
 
+/// Migration protocol for lmdeploy PD disaggregation
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum LMDeployMigrationProtocol {
+    /// RDMA-based KV migration (default and recommended)
+    #[default]
+    #[serde(rename = "rdma")]
+    #[value(name = "rdma")]
+    Rdma,
+    /// NVLink-based KV migration
+    #[serde(rename = "nvlink")]
+    #[value(name = "nvlink")]
+    Nvlink,
+}
+
+/// RDMA link type used by lmdeploy's migration backend.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum LMDeployRdmaLinkType {
+    /// InfiniBand
+    #[serde(rename = "IB")]
+    #[value(name = "ib")]
+    Ib,
+    /// RDMA over Converged Ethernet
+    #[default]
+    #[serde(rename = "RoCE")]
+    #[value(name = "roce")]
+    Roce,
+}
+
+/// RDMA configuration for lmdeploy PD KV migration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LMDeployRdmaConfig {
+    /// Whether GPU Direct RDMA is enabled.
+    #[serde(default = "default_lmdeploy_with_gdr")]
+    pub with_gdr: bool,
+    /// RDMA link type (RoCE by default).
+    #[serde(default)]
+    pub link_type: LMDeployRdmaLinkType,
+}
+
+fn default_lmdeploy_with_gdr() -> bool {
+    true
+}
+
+impl Default for LMDeployRdmaConfig {
+    fn default() -> Self {
+        Self {
+            with_gdr: true,
+            link_type: LMDeployRdmaLinkType::Roce,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(tag = "type")]
 pub enum ConnectionMode {
@@ -950,21 +1003,56 @@ pub enum RoutingMode {
         #[serde(skip_serializing_if = "Option::is_none")]
         discovery_address: Option<String>,
     },
+    #[serde(rename = "lmdeploy_prefill_decode")]
+    LMDeployPrefillDecode {
+        /// lmdeploy prefill worker URLs
+        prefill_urls: Vec<String>,
+        /// lmdeploy decode worker URLs
+        decode_urls: Vec<String>,
+        /// Optional separate policy for prefill workers
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prefill_policy: Option<PolicyConfig>,
+        /// Optional separate policy for decode workers
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decode_policy: Option<PolicyConfig>,
+        /// KV migration protocol (rdma/nvlink)
+        #[serde(default)]
+        migration_protocol: LMDeployMigrationProtocol,
+        /// Optional RDMA configuration
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rdma_config: Option<LMDeployRdmaConfig>,
+        /// Whether to use dummy prefill (skip actual prefill compute)
+        #[serde(default)]
+        dummy_prefill: bool,
+    },
 }
 
 impl RoutingMode {
     pub fn is_pd_mode(&self) -> bool {
-        matches!(self, RoutingMode::VllmPrefillDecode { .. })
+        matches!(
+            self,
+            RoutingMode::VllmPrefillDecode { .. } | RoutingMode::LMDeployPrefillDecode { .. }
+        )
     }
 
     pub fn is_vllm_pd_mode(&self) -> bool {
         matches!(self, RoutingMode::VllmPrefillDecode { .. })
     }
 
+    /// Returns true if this is lmdeploy PD disaggregation mode
+    pub fn is_lmdeploy_pd_mode(&self) -> bool {
+        matches!(self, RoutingMode::LMDeployPrefillDecode { .. })
+    }
+
     pub fn worker_count(&self) -> usize {
         match self {
             RoutingMode::Regular { worker_urls } => worker_urls.len(),
             RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } => prefill_urls.len() + decode_urls.len(),
+            RoutingMode::LMDeployPrefillDecode {
                 prefill_urls,
                 decode_urls,
                 ..
@@ -981,6 +1069,9 @@ impl RoutingMode {
             RoutingMode::VllmPrefillDecode { prefill_policy, .. } => {
                 prefill_policy.as_ref().unwrap_or(main_policy)
             }
+            RoutingMode::LMDeployPrefillDecode { prefill_policy, .. } => {
+                prefill_policy.as_ref().unwrap_or(main_policy)
+            }
             _ => main_policy,
         }
     }
@@ -990,6 +1081,9 @@ impl RoutingMode {
     pub fn get_decode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
         match self {
             RoutingMode::VllmPrefillDecode { decode_policy, .. } => {
+                decode_policy.as_ref().unwrap_or(main_policy)
+            }
+            RoutingMode::LMDeployPrefillDecode { decode_policy, .. } => {
                 decode_policy.as_ref().unwrap_or(main_policy)
             }
             _ => main_policy,
@@ -1358,6 +1452,7 @@ impl RouterConfig {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
             RoutingMode::VllmPrefillDecode { .. } => "vllm_prefill_decode",
+            RoutingMode::LMDeployPrefillDecode { .. } => "lmdeploy_prefill_decode",
             RoutingMode::OpenAI { .. } => "openai",
         }
     }
@@ -1758,6 +1853,197 @@ mod tests {
         assert!(json.contains("\"type\":\"vllm_prefill_decode\""));
         assert!(json.contains("\"prefill_urls\""));
         assert!(json.contains("\"decode_urls\""));
+    }
+
+    #[test]
+    fn test_lmdeploy_prefill_decode_serialization() {
+        let lmdeploy_pd = RoutingMode::LMDeployPrefillDecode {
+            prefill_urls: vec!["http://prefill1".to_string()],
+            decode_urls: vec!["http://decode1".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            migration_protocol: LMDeployMigrationProtocol::Rdma,
+            rdma_config: None,
+            dummy_prefill: false,
+        };
+        let json = serde_json::to_string(&lmdeploy_pd).unwrap();
+        assert!(json.contains("\"type\":\"lmdeploy_prefill_decode\""));
+        assert!(json.contains("\"prefill_urls\""));
+        assert!(json.contains("\"decode_urls\""));
+        assert!(json.contains("\"migration_protocol\":\"rdma\""));
+        assert!(!json.contains("\"rdma_config\""));
+        assert!(json.contains("\"dummy_prefill\":false"));
+
+        // Round-trip
+        let deserialized: RoutingMode = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.is_pd_mode());
+        assert!(deserialized.is_lmdeploy_pd_mode());
+        assert!(!deserialized.is_vllm_pd_mode());
+        assert_eq!(deserialized.worker_count(), 2);
+
+        // Test with rdma config and dummy_prefill=true
+        let lmdeploy_pd_rdma = RoutingMode::LMDeployPrefillDecode {
+            prefill_urls: vec!["http://p:8000".to_string()],
+            decode_urls: vec!["http://d:8000".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            migration_protocol: LMDeployMigrationProtocol::Rdma,
+            rdma_config: Some(LMDeployRdmaConfig {
+                with_gdr: true,
+                link_type: LMDeployRdmaLinkType::Roce,
+            }),
+            dummy_prefill: true,
+        };
+        let json_rdma = serde_json::to_string(&lmdeploy_pd_rdma).unwrap();
+        assert!(json_rdma.contains("\"migration_protocol\":\"rdma\""));
+        assert!(json_rdma.contains("\"rdma_config\""));
+        assert!(json_rdma.contains("\"with_gdr\":true"));
+        assert!(json_rdma.contains("\"link_type\":\"RoCE\""));
+        assert!(json_rdma.contains("\"dummy_prefill\":true"));
+    }
+
+    #[test]
+    fn test_lmdeploy_migration_protocol_default() {
+        assert_eq!(
+            LMDeployMigrationProtocol::default(),
+            LMDeployMigrationProtocol::Rdma
+        );
+    }
+
+    #[test]
+    fn test_lmdeploy_migration_protocol_serde_variants() {
+        // Router configuration uses stable, human-readable lowercase strings.
+        assert_eq!(
+            serde_json::to_string(&LMDeployMigrationProtocol::Rdma).unwrap(),
+            r#""rdma""#
+        );
+        assert_eq!(
+            serde_json::to_string(&LMDeployMigrationProtocol::Nvlink).unwrap(),
+            r#""nvlink""#
+        );
+        // Round-trip deserialization
+        let rdma: LMDeployMigrationProtocol = serde_json::from_str(r#""rdma""#).unwrap();
+        assert_eq!(rdma, LMDeployMigrationProtocol::Rdma);
+        let nvlink: LMDeployMigrationProtocol = serde_json::from_str(r#""nvlink""#).unwrap();
+        assert_eq!(nvlink, LMDeployMigrationProtocol::Nvlink);
+    }
+
+    #[test]
+    fn test_lmdeploy_rdma_config_defaults() {
+        let config = LMDeployRdmaConfig::default();
+        assert!(config.with_gdr);
+        assert_eq!(config.link_type, LMDeployRdmaLinkType::Roce);
+
+        let cfg: LMDeployRdmaConfig = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.with_gdr);
+        assert_eq!(cfg.link_type, LMDeployRdmaLinkType::Roce);
+    }
+
+    #[test]
+    fn test_lmdeploy_pd_mode_type_via_json() {
+        // RoutingMode doesn't have a mode_type() method; verify via JSON serialization tag.
+        let mode = RoutingMode::LMDeployPrefillDecode {
+            prefill_urls: vec!["http://p:8000".to_string()],
+            decode_urls: vec!["http://d:8000".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            migration_protocol: LMDeployMigrationProtocol::Rdma,
+            rdma_config: None,
+            dummy_prefill: false,
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(json.contains(r#""type":"lmdeploy_prefill_decode""#));
+    }
+
+    #[test]
+    fn test_lmdeploy_pd_worker_count_multiple_urls() {
+        let mode = RoutingMode::LMDeployPrefillDecode {
+            prefill_urls: vec![
+                "http://p1".to_string(),
+                "http://p2".to_string(),
+                "http://p3".to_string(),
+            ],
+            decode_urls: vec!["http://d1".to_string(), "http://d2".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            migration_protocol: LMDeployMigrationProtocol::Rdma,
+            rdma_config: None,
+            dummy_prefill: false,
+        };
+        assert_eq!(mode.worker_count(), 5);
+    }
+
+    #[test]
+    fn test_lmdeploy_pd_policy_fallback_to_main() {
+        let main_policy = PolicyConfig::RoundRobin;
+        let mode = RoutingMode::LMDeployPrefillDecode {
+            prefill_urls: vec!["http://p".to_string()],
+            decode_urls: vec!["http://d".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            migration_protocol: LMDeployMigrationProtocol::Rdma,
+            rdma_config: None,
+            dummy_prefill: false,
+        };
+        // When prefill_policy/decode_policy is None, should fall back to main policy.
+        // Compare by name() since PolicyConfig doesn't derive PartialEq.
+        let prefill = mode.get_prefill_policy(&main_policy);
+        let decode = mode.get_decode_policy(&main_policy);
+        assert_eq!(prefill.name(), main_policy.name());
+        assert_eq!(decode.name(), main_policy.name());
+    }
+
+    #[test]
+    fn test_lmdeploy_pd_policy_override() {
+        let main_policy = PolicyConfig::RoundRobin;
+        let custom_policy = PolicyConfig::Random;
+        let mode = RoutingMode::LMDeployPrefillDecode {
+            prefill_urls: vec!["http://p".to_string()],
+            decode_urls: vec!["http://d".to_string()],
+            prefill_policy: Some(custom_policy.clone()),
+            decode_policy: Some(custom_policy.clone()),
+            migration_protocol: LMDeployMigrationProtocol::Rdma,
+            rdma_config: None,
+            dummy_prefill: false,
+        };
+        // Should use custom policy, not main. Compare by name() since PolicyConfig doesn't derive PartialEq.
+        let prefill = mode.get_prefill_policy(&main_policy);
+        let decode = mode.get_decode_policy(&main_policy);
+        assert_eq!(prefill.name(), "random");
+        assert_eq!(decode.name(), "random");
+    }
+
+    #[test]
+    fn test_lmdeploy_pd_deserialize_from_json() {
+        let json_str = r#"{
+            "type": "lmdeploy_prefill_decode",
+            "prefill_urls": ["http://p:23333"],
+            "decode_urls": ["http://d:23333"],
+            "migration_protocol": "rdma",
+            "rdma_config": {"with_gdr": true, "link_type": "RoCE"},
+            "dummy_prefill": true
+        }"#;
+        let mode: RoutingMode = serde_json::from_str(json_str).unwrap();
+        assert!(mode.is_lmdeploy_pd_mode());
+        assert!(mode.is_pd_mode());
+        assert!(!mode.is_vllm_pd_mode());
+        assert_eq!(mode.worker_count(), 2);
+    }
+
+    #[test]
+    fn test_lmdeploy_pd_no_rdma_config_when_protocol_is_nvlink() {
+        let mode = RoutingMode::LMDeployPrefillDecode {
+            prefill_urls: vec!["http://p".to_string()],
+            decode_urls: vec!["http://d".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            migration_protocol: LMDeployMigrationProtocol::Nvlink,
+            rdma_config: None,
+            dummy_prefill: false,
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        // Option::None fields are skipped by serde by default; rdma_config should be absent.
+        assert!(!json.contains("rdma_config"));
     }
 
     // ============= PolicyConfig Tests =============

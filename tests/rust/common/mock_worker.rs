@@ -302,6 +302,11 @@ async fn generate_handler(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let output_ids = payload
+        .get("input_ids")
+        .filter(|value| value.is_array())
+        .map(|_| vec![9001, 9002])
+        .unwrap_or_default();
 
     if is_stream {
         let stream_delay = config.response_delay_ms;
@@ -330,6 +335,7 @@ async fn generate_handler(
 
             let data = json!({
                 "text": format!("Mock response {}", i + 1),
+                "output_ids": output_ids,
                 "meta_info": {
                     "prompt_tokens": 10,
                     "completion_tokens": 5,
@@ -363,6 +369,7 @@ async fn generate_handler(
     } else {
         Json(json!({
             "text": "This is a mock response.",
+            "output_ids": output_ids,
             "meta_info": {
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
@@ -414,6 +421,12 @@ async fn chat_completions_handler(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let output_ids = (payload
+        .get("return_token_ids")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        && payload.get("input_ids").is_some())
+    .then_some(vec![9001, 9002]);
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -434,6 +447,7 @@ async fn chat_completions_handler(
                     "delta": {
                         "content": "This is a mock chat response."
                     },
+                    "output_ids": output_ids,
                     "finish_reason": null
                 }]
             });
@@ -457,6 +471,7 @@ async fn chat_completions_handler(
                     "role": "assistant",
                     "content": "This is a mock chat response."
                 },
+                "output_ids": output_ids,
                 "finish_reason": "stop"
             }],
             "usage": {

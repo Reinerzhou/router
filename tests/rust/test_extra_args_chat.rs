@@ -73,3 +73,18 @@ fn test_no_other_fields_gives_empty_map() {
     let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
     assert!(req.other.is_empty());
 }
+
+#[test]
+fn test_lmdeploy_input_ids_is_typed_not_flattened() {
+    let json = r#"{
+        "model": "test-model",
+        "messages": [],
+        "input_ids": [1, 2, 3],
+        "return_token_ids": true
+    }"#;
+
+    let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(req.input_ids, Some(vec![1, 2, 3]));
+    assert!(!req.other.contains_key("input_ids"));
+    assert_eq!(req.other["return_token_ids"], serde_json::json!(true));
+}

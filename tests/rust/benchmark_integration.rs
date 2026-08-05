@@ -27,6 +27,7 @@ fn default_generate_request() -> GenerateRequest {
         session_params: None,
         return_hidden_states: false,
         rid: None,
+        other: serde_json::Map::new(),
     }
 }
 
@@ -35,6 +36,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
         model: None,
         messages: vec![],
+        input_ids: None,
         max_tokens: None,
         max_completion_tokens: None,
         temperature: None,

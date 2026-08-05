@@ -352,6 +352,11 @@ pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
     pub messages: Vec<ChatMessage>,
 
+    /// Pre-tokenized input for LMDeploy token-in-token-out requests.
+    /// This is used when `messages` is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_ids: Option<Vec<i32>>,
+
     /// What sampling temperature to use, between 0 and 2
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -751,6 +756,13 @@ pub struct ChatChoice {
     /// Hidden states from the model (VLLM extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
+    /// Generated token IDs (LMDeploy extension, enabled by `return_token_ids`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_ids: Option<Vec<i32>>,
+    /// Preserve LMDeploy extensions such as `output_token_logprobs` and
+    /// `routed_experts`, as well as future backend-specific choice fields.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 // ============= Streaming Response =============
@@ -775,6 +787,13 @@ pub struct ChatStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
+    /// Generated token IDs for this stream chunk (LMDeploy extension).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_ids: Option<Vec<i32>>,
+    /// Preserve LMDeploy extensions such as `output_token_logprobs` and
+    /// `routed_experts`, as well as future backend-specific choice fields.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 // ==================================================================
@@ -2164,6 +2183,45 @@ pub struct GenerateRequest {
     /// Request ID for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
+
+    /// Pass-through fields (e.g. max_tokens, temperature, stop, stop_token_ids,
+    /// session_id, repetition_penalty, top_k, top_p, min_p, ignore_eos, etc.)
+    /// for backends like lmdeploy whose /generate endpoint accepts these as
+    /// top-level fields. Without this flatten map, unknown fields would be
+    /// silently dropped during deserialization and lost when re-serializing
+    /// the request to the backend.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// LMDeploy `/generate` response metadata.
+///
+/// LMDeploy evolves this object independently of the router, so known token
+/// accounting fields are typed while additional fields are retained verbatim.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenerateResponseMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_token_logprobs: Option<Vec<(f32, i32)>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<Value>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// LMDeploy `/generate` token-in-token-out response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenerateResponse {
+    pub text: String,
+    pub output_ids: Vec<i32>,
+    pub meta_info: GenerateResponseMeta,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 impl GenerationRequest for GenerateRequest {
@@ -5211,5 +5269,204 @@ mod tests {
                 _ => panic!("Expected Assistant message"),
             }
         }
+    }
+
+    // ===== lmdeploy token-in-token-out routing tests =====
+
+    #[test]
+    fn test_chat_completion_extract_routing_with_input_ids() {
+        // Build a ChatCompletionRequest via JSON deserialization (lmdeploy-style:
+        // empty messages + input_ids fallback).
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [],
+            "input_ids": [151644, 8948, 198, 2610],
+        });
+        let req: ChatCompletionRequest =
+            serde_json::from_value(body).expect("deserialize chat request");
+        assert_eq!(req.extract_text_for_routing(), "151644 8948 198 2610");
+    }
+
+    #[test]
+    fn test_chat_completion_extract_routing_session_id_takes_priority() {
+        // session_params.session_id should win over input_ids.
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [],
+            "input_ids": [1, 2, 3],
+            "session_params": {"session_id": "sess-abc"}
+        });
+        let req: ChatCompletionRequest =
+            serde_json::from_value(body).expect("deserialize chat request");
+        assert_eq!(req.extract_text_for_routing(), "sess-abc");
+    }
+
+    #[test]
+    fn test_chat_completion_extract_routing_empty_when_no_keys() {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let req: ChatCompletionRequest =
+            serde_json::from_value(body).expect("deserialize chat request");
+        assert_eq!(req.extract_text_for_routing(), "");
+    }
+
+    #[test]
+    fn test_chat_completion_rejects_non_lmdeploy_input_ids_shapes() {
+        for input_ids in [
+            serde_json::json!([[10, 20], [30, 40]]),
+            serde_json::json!([10, "invalid", 20]),
+            serde_json::json!("not-an-array"),
+        ] {
+            let body = serde_json::json!({
+                "model": "test-model",
+                "messages": [],
+                "input_ids": input_ids,
+            });
+            assert!(serde_json::from_value::<ChatCompletionRequest>(body).is_err());
+        }
+    }
+
+    #[test]
+    fn test_chat_completion_preserves_typed_input_ids_on_serialize() {
+        // Ensure input_ids survives round-trip serialization (forwarded to backend).
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [],
+            "input_ids": [1, 2, 3],
+            "max_tokens": 16,
+        });
+        let req: ChatCompletionRequest =
+            serde_json::from_value(body).expect("deserialize chat request");
+        assert_eq!(req.input_ids, Some(vec![1, 2, 3]));
+        assert!(!req.other.contains_key("input_ids"));
+        let out = serde_json::to_value(&req).expect("serialize chat request");
+        assert_eq!(out["input_ids"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_chat_completion_preserves_all_lmdeploy_token_input_fields() {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [],
+            "input_ids": [1, 2, 3],
+            "image_data": ["data:image/png;base64,AAAA"],
+            "do_preprocess": false,
+            "return_token_ids": true,
+        });
+        let req: ChatCompletionRequest =
+            serde_json::from_value(body.clone()).expect("deserialize chat request");
+        let out = serde_json::to_value(&req).expect("serialize chat request");
+        for field in [
+            "input_ids",
+            "image_data",
+            "do_preprocess",
+            "return_token_ids",
+        ] {
+            assert_eq!(out[field], body[field], "field {field} must survive");
+        }
+    }
+
+    #[test]
+    fn test_generate_request_preserves_lmdeploy_token_input_fields() {
+        let body = serde_json::json!({
+            "input_ids": [151644, 8948, 198],
+            "session_id": 42,
+            "max_tokens": 16,
+            "return_logprob": true,
+            "stream": false,
+        });
+        let req: GenerateRequest =
+            serde_json::from_value(body.clone()).expect("deserialize generate request");
+        assert_eq!(req.extract_text_for_routing(), "151644 8948 198");
+
+        let out = serde_json::to_value(&req).expect("serialize generate request");
+        for field in ["input_ids", "session_id", "max_tokens", "return_logprob"] {
+            assert_eq!(out[field], body[field], "field {field} must survive");
+        }
+    }
+
+    #[test]
+    fn test_lmdeploy_chat_response_preserves_output_ids() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+                "output_ids": [100, 101],
+                "output_token_logprobs": [[-0.1, 100]],
+                "routed_experts": [[[1, 2]]]
+            }],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5
+            }
+        });
+        let response: ChatCompletionResponse =
+            serde_json::from_value(body.clone()).expect("deserialize chat response");
+        assert_eq!(response.choices[0].output_ids, Some(vec![100, 101]));
+        assert!(response.choices[0]
+            .other
+            .contains_key("output_token_logprobs"));
+        assert!(response.choices[0].other.contains_key("routed_experts"));
+
+        let out = serde_json::to_value(response).expect("serialize chat response");
+        assert_eq!(
+            out["choices"][0]["output_ids"],
+            body["choices"][0]["output_ids"]
+        );
+        assert_eq!(
+            out["choices"][0]["output_token_logprobs"],
+            body["choices"][0]["output_token_logprobs"]
+        );
+    }
+
+    #[test]
+    fn test_lmdeploy_chat_stream_response_preserves_output_ids() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "ok"},
+                "finish_reason": null,
+                "output_ids": [100, 101]
+            }]
+        });
+        let response: ChatCompletionStreamResponse =
+            serde_json::from_value(body).expect("deserialize chat stream response");
+        assert_eq!(response.choices[0].output_ids, Some(vec![100, 101]));
+    }
+
+    #[test]
+    fn test_lmdeploy_generate_response_preserves_output_ids() {
+        let body = serde_json::json!({
+            "text": "ok",
+            "output_ids": [100, 101],
+            "meta_info": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "finish_reason": {"type": "stop"},
+                "output_token_logprobs": [[-0.1, 100]],
+                "first_token_latency": 0.01
+            }
+        });
+        let response: GenerateResponse =
+            serde_json::from_value(body.clone()).expect("deserialize generate response");
+        assert_eq!(response.output_ids, vec![100, 101]);
+        assert_eq!(response.meta_info.prompt_tokens, Some(3));
+        assert!(response.meta_info.other.contains_key("first_token_latency"));
+
+        let out = serde_json::to_value(response).expect("serialize generate response");
+        assert_eq!(out["output_ids"], body["output_ids"]);
+        assert_eq!(out["meta_info"]["first_token_latency"], 0.01);
     }
 }
