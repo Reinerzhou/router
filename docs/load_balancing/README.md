@@ -42,17 +42,18 @@ The consistent hash policy extracts a routing key in the following priority orde
 
 | Priority | Source | Header/Field | Example |
 |----------|--------|--------------|---------|
-| 1 | HTTP Header | `X-Session-ID` | `X-Session-ID: session-abc-123` |
-| 2 | HTTP Header | `X-User-ID` | `X-User-ID: user-456` |
-| 3 | HTTP Header | `X-Tenant-ID` | `X-Tenant-ID: tenant-xyz` |
-| 4 | HTTP Header | `X-Request-ID` | `X-Request-ID: req-789` |
+| 1 | HTTP Header | `X-Session-Affinity` | `X-Session-Affinity: affinity-abc-123` |
+| 2 | HTTP Header | `X-Session-ID` | `X-Session-ID: session-abc-123` |
+| 3 | HTTP Header | `X-User-ID` | `X-User-ID: user-456` |
+| 4 | HTTP Header | `X-Tenant-ID` | `X-Tenant-ID: tenant-xyz` |
 | 5 | HTTP Header | `X-Correlation-ID` | `X-Correlation-ID: corr-001` |
-| 6 | HTTP Header | `X-Trace-ID` | `X-Trace-ID: trace-002` |
-| 7 | Request Body | `session_params.session_id` | `{"session_params": {"session_id": "..."}}` |
-| 8 | Request Body | `user` | `{"user": "..."}` (OpenAI format) |
-| 9 | Request Body | `session_id` | `{"session_id": "..."}` (legacy) |
-| 10 | Request Body | `user_id` | `{"user_id": "..."}` (legacy) |
-| 11 | Fallback | Request body hash | Hash of entire request body |
+| 6 | HTTP Header | `X-Request-ID` | `X-Request-ID: req-789` |
+| 7 | HTTP Header | `X-Trace-ID` | `X-Trace-ID: trace-002` |
+| 8 | Request Body | `session_params.session_id` | `{"session_params": {"session_id": "..."}}` |
+| 9 | Request Body | `user` | `{"user": "..."}` (OpenAI format) |
+| 10 | Request Body | `session_id` | `{"session_id": "..."}` (legacy) |
+| 11 | Request Body | `user_id` | `{"user_id": "..."}` (legacy) |
+| 12 | Fallback | Request body hash | Hash of entire request body |
 
 ### Usage Examples
 
@@ -64,7 +65,16 @@ HTTP headers are the **recommended approach** for session affinity because:
 - Compatible with standard infrastructure tools (Nginx, Envoy, K8s Ingress)
 
 ```bash
-# Using X-Session-ID header (recommended)
+# Using X-Session-Affinity header (highest priority)
+curl -X POST http://router:8000/v1/chat/completions \
+  -H "X-Session-Affinity: conversation-12345" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+
+# Using X-Session-ID header
 curl -X POST http://router:8000/v1/chat/completions \
   -H "X-Session-ID: conversation-12345" \
   -H "Content-Type: application/json" \

@@ -9,6 +9,7 @@ use tracing::debug;
 
 /// HTTP header names to check for session ID (case-insensitive, checked in order)
 pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
+    "x-session-affinity",
     "x-session-id",
     "x-user-id",
     "x-tenant-id",
@@ -20,7 +21,7 @@ pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
 /// Extract hash key with priority: HTTP headers > body fields > request content hash
 ///
 /// Priority order:
-/// 1. HTTP Headers: x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
+/// 1. HTTP Headers: x-session-affinity, x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
 /// 2. Body: session_params.session_id (nested)
 /// 3. Body: user field (OpenAI format)
 /// 4. Body: session_id (legacy)
@@ -354,6 +355,16 @@ mod tests {
         // x-session-id has higher priority than x-request-id
         let key = extract_hash_key_from_headers(&headers).unwrap();
         assert_eq!(key, "header:x-session-id:sess-1");
+    }
+
+    #[test]
+    fn test_header_extraction_session_affinity_priority() {
+        let mut headers = HashMap::new();
+        headers.insert("x-session-affinity".to_string(), "affinity-1".to_string());
+        headers.insert("x-session-id".to_string(), "sess-1".to_string());
+
+        let key = extract_hash_key_from_headers(&headers).unwrap();
+        assert_eq!(key, "header:x-session-affinity:affinity-1");
     }
 
     #[test]

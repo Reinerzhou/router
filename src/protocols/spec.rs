@@ -62,6 +62,12 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ChatMessage {
+    Developer {
+        role: String,
+        content: DeveloperMessageContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     System {
         role: String,
         content: String,
@@ -115,6 +121,24 @@ impl<'de> Deserialize<'de> for ChatMessage {
             .ok_or_else(|| D::Error::custom("missing role field"))?;
 
         match role {
+            "developer" => {
+                let content = value
+                    .get("content")
+                    .ok_or_else(|| D::Error::custom("developer message missing content field"))?;
+                let content = serde_json::from_value(content.clone())
+                    .map_err(|e| D::Error::custom(format!("invalid developer content: {}", e)))?;
+                Ok(ChatMessage::Developer {
+                    role: role.to_string(),
+                    content,
+                    name: value.get("name").and_then(|n| {
+                        if n.is_null() {
+                            None
+                        } else {
+                            n.as_str().map(String::from)
+                        }
+                    }),
+                })
+            }
             "assistant" => Ok(ChatMessage::Assistant {
                 role: role.to_string(),
                 content: value.get("content").and_then(|c| {
@@ -266,6 +290,29 @@ pub struct StructuredOutputsParams {
 pub enum UserMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DeveloperMessageContent {
+    Text(String),
+    Parts(Vec<DeveloperContentPart>),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum DeveloperContentPart {
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<PromptCacheBreakpoint>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptCacheBreakpoint {
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3740,6 +3787,59 @@ mod tests {
             }
             _ => panic!("Expected Assistant message"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_developer_text_round_trip() {
+        let json = r#"{
+            "role": "developer",
+            "content": "You are helpful.",
+            "name": "router"
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_value(&message).unwrap();
+
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "role": "developer",
+                "content": "You are helpful.",
+                "name": "router"
+            })
+        );
+    }
+
+    #[test]
+    fn test_chat_message_developer_text_parts_round_trip() {
+        let json = r#"{
+            "role": "developer",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "You are helpful.",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }
+            ]
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_value(&message).unwrap();
+
+        assert_eq!(serialized, serde_json::from_str::<Value>(json).unwrap());
+    }
+
+    #[test]
+    fn test_chat_message_developer_rejects_non_text_parts() {
+        let json = r#"{
+            "role": "developer",
+            "content": [{"type": "image_url", "image_url": {"url": "https://example.com"}}]
+        }"#;
+
+        let error = serde_json::from_str::<ChatMessage>(json)
+            .expect_err("developer content must only contain text parts");
+
+        assert!(error.to_string().contains("invalid developer content"));
     }
 
     #[test]
