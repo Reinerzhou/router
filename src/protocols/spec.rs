@@ -84,9 +84,9 @@ pub enum ChatMessage {
         tool_calls: Option<Vec<ToolCall>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         function_call: Option<FunctionCallResponse>,
-        /// Reasoning content for reasoning models. The custom Deserialize impl
-        /// below also accepts the deprecated `reasoning_content` alias.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Historical reasoning, always forwarded as LMDeploy's `reasoning_content`.
+        /// The custom Deserialize impl also accepts `reasoning` from vLLM clients.
+        #[serde(rename = "reasoning_content", skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
     },
     Tool {
@@ -145,14 +145,12 @@ impl<'de> Deserialize<'de> for ChatMessage {
                         serde_json::from_value(fc.clone()).ok()
                     }
                 }),
-                // `reasoning` is vLLM's canonical field. Prefer a usable canonical
-                // string when both keys are present; otherwise fall back to the
-                // deprecated `reasoning_content` alias, including when `reasoning`
-                // is null or not a string. Serialization remains canonical.
+                // Prefer LMDeploy's field, including an explicit empty string.
+                // Fall back to the alias when it is absent, null, or not a string.
                 reasoning: value
-                    .get("reasoning")
+                    .get("reasoning_content")
                     .and_then(Value::as_str)
-                    .or_else(|| value.get("reasoning_content").and_then(Value::as_str))
+                    .or_else(|| value.get("reasoning").and_then(Value::as_str))
                     .map(String::from),
             }),
             "system" => Ok(ChatMessage::System {
@@ -522,7 +520,7 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub echo: Option<bool>,
 
-    /// Reasoning effort level for reasoning models (low, medium, high)
+    /// Reasoning effort level for reasoning models (low, medium, high, max)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -889,6 +887,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    Max,
 }
 
 // ============= Input/Output Items =============
@@ -3872,83 +3871,46 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_message_assistant_reasoning_content_alias_roundtrip() {
-        // Regression: assistant turns using the deprecated `reasoning_content`
-        // alias must survive forwarding and normalize to canonical `reasoning`.
-        let json = r#"{
+    fn test_chat_message_assistant_reasoning_content_roundtrip() {
+        let input = serde_json::json!({
             "role": "assistant",
             "content": "The answer is 42.",
             "reasoning_content": "First I considered X, then Y..."
-        }"#;
-
-        let message: ChatMessage = serde_json::from_str(json).unwrap();
-        match &message {
-            ChatMessage::Assistant { reasoning, .. } => {
-                assert_eq!(
-                    reasoning.as_deref(),
-                    Some("First I considered X, then Y...")
-                );
-            }
-            _ => panic!("Expected Assistant message"),
-        }
-
-        // Re-serialization emits only vLLM's canonical field.
+        });
+        let message: ChatMessage = serde_json::from_value(input.clone()).unwrap();
         let serialized = serde_json::to_value(&message).unwrap();
-        assert_eq!(
-            serialized.get("reasoning").and_then(|v| v.as_str()),
-            Some("First I considered X, then Y..."),
-        );
-        assert!(serialized.get("reasoning_content").is_none());
 
-        let reparsed: ChatMessage = serde_json::from_value(serialized).unwrap();
-        match reparsed {
-            ChatMessage::Assistant { reasoning, .. } => {
-                assert_eq!(
-                    reasoning.as_deref(),
-                    Some("First I considered X, then Y...")
-                );
-            }
-            _ => panic!("Expected Assistant message"),
-        }
+        assert_eq!(serialized, input);
     }
 
     #[test]
-    fn test_chat_message_assistant_reasoning_alias_precedence() {
-        let cases = [
-            (
-                r#"{
-                    "role": "assistant",
-                    "reasoning": "canonical",
-                    "reasoning_content": "deprecated alias"
-                }"#,
-                "canonical",
-            ),
-            (
-                r#"{
-                    "role": "assistant",
-                    "reasoning": null,
-                    "reasoning_content": "deprecated alias"
-                }"#,
-                "deprecated alias",
-            ),
-            (
-                r#"{
-                    "role": "assistant",
-                    "reasoning": 42,
-                    "reasoning_content": "deprecated alias"
-                }"#,
-                "deprecated alias",
-            ),
-        ];
+    fn test_chat_message_assistant_reasoning_content_precedence() {
+        use serde_json::json;
 
-        for (json, expected) in cases {
-            let message: ChatMessage = serde_json::from_str(json).unwrap();
-            match message {
-                ChatMessage::Assistant { reasoning, .. } => {
-                    assert_eq!(reasoning.as_deref(), Some(expected));
-                }
-                _ => panic!("Expected Assistant message"),
-            }
+        for (reasoning, reasoning_content, expected) in [
+            (json!("alias"), json!("native"), Some("native")),
+            (json!(null), json!("native"), Some("native")),
+            (json!(42), json!("native"), Some("native")),
+            (json!("alias"), json!(null), Some("alias")),
+            (json!("alias"), json!(42), Some("alias")),
+            (json!(""), json!("native"), Some("native")),
+            (json!("alias"), json!(""), Some("")),
+            (json!(null), json!(null), None),
+            (json!(42), json!(false), None),
+        ] {
+            let message: ChatMessage = serde_json::from_value(json!({
+                "role": "assistant",
+                "reasoning": reasoning,
+                "reasoning_content": reasoning_content
+            }))
+            .unwrap();
+            let serialized = serde_json::to_value(&message).unwrap();
+
+            assert!(serialized.get("reasoning").is_none());
+            assert_eq!(
+                serialized.get("reasoning_content").cloned(),
+                expected.map(Value::from)
+            );
         }
     }
 
