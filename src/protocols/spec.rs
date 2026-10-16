@@ -561,7 +561,7 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub echo: Option<bool>,
 
-    /// Reasoning effort level for reasoning models (low, medium, high)
+    /// Reasoning effort level for reasoning models (low, medium, high, max)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -902,6 +902,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    Max,
 }
 
 // ============= Input/Output Items =============
@@ -3261,6 +3262,37 @@ mod tests {
         };
         // Only top-level string elements are extracted
         assert_eq!(req.extract_text_for_routing(), "a");
+    }
+
+    #[test]
+    fn test_chat_completion_reasoning_effort_roundtrip() {
+        for effort in ["low", "medium", "high", "max"] {
+            let input = serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": effort
+            });
+            let request: ChatCompletionRequest = serde_json::from_value(input).unwrap();
+            assert!(request.reasoning_effort.is_some());
+
+            let forwarded = serde_json::to_value(&request).unwrap();
+            assert_eq!(forwarded["reasoning_effort"], effort);
+        }
+    }
+
+    #[test]
+    fn test_responses_reasoning_effort_roundtrip() {
+        for effort in ["low", "medium", "high", "max"] {
+            let input = serde_json::json!({
+                "model": "test-model",
+                "input": "Hello",
+                "reasoning": {"effort": effort}
+            });
+            let request: ResponsesRequest = serde_json::from_value(input).unwrap();
+            let forwarded = serde_json::to_value(&request).unwrap();
+
+            assert_eq!(forwarded["reasoning"]["effort"], effort);
+        }
     }
 
     // ==================================================================

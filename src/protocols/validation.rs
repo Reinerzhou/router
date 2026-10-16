@@ -1193,7 +1193,7 @@ mod tests {
             assert!(request.reasoning_effort.is_none());
             assert!(request.validate().is_ok());
 
-            // Valid reasoning_effort values: Low, Medium, High
+            // Valid reasoning_effort values: Low, Medium, High, Max
             request.reasoning_effort = Some(ReasoningEffort::Low);
             assert!(request.validate().is_ok());
 
@@ -1201,6 +1201,9 @@ mod tests {
             assert!(request.validate().is_ok());
 
             request.reasoning_effort = Some(ReasoningEffort::High);
+            assert!(request.validate().is_ok());
+
+            request.reasoning_effort = Some(ReasoningEffort::Max);
             assert!(request.validate().is_ok());
         }
 
