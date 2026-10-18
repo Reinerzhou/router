@@ -1842,6 +1842,84 @@ mod tests {
         assert!(result.unwrap_err().contains("Timeout"));
     }
 
+    #[tokio::test]
+    async fn test_messages_proxy_preserves_key_order() {
+        use crate::config::RouterConfig;
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use axum::{routing::post, Router as AxumRouter};
+        use tokio::net::TcpListener;
+        use tower::ServiceExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let backend = AxumRouter::new().route(
+            "/v1/messages",
+            post(|body: bytes::Bytes| async move { body }),
+        );
+        let backend_task = tokio::spawn(async move {
+            axum::serve(listener, backend).await.unwrap();
+        });
+
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router
+            .worker_registry
+            .register(Arc::new(BasicWorker::new(worker_url, WorkerType::Regular)));
+        router.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let context = AppContext::new(
+            RouterConfig::default(),
+            router.client.clone(),
+            4,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            router: Arc::new(router),
+            context: Arc::new(context),
+            concurrency_queue_tx: None,
+            router_manager: None,
+        });
+        let app = build_app_with_request_tracing(state, 1024 * 1024, vec![], vec![], true, false);
+
+        // Compare raw bytes: Value equality would hide object-key reordering.
+        for input in [
+            concat!(
+                r#"{"model":"test-model","max_tokens":1,"messages":[{"role":"user","content":"test"}],"tools":["#,
+                r#"{"name":"screenshot","input_schema":{"type":"object","properties":{}}}]}"#,
+            ),
+            concat!(
+                r#"{"model":"test-model","max_tokens":1,"messages":[{"role":"assistant","content":["#,
+                r#"{"type":"tool_use","id":"call_1","name":"lookup","input":{"zebra":1,"apple":2}}]}],"tools":["#,
+                r#"{"name":"lookup","input_schema":{"type":"object","properties":{"#,
+                r#""zebra":{"type":"string","description":"first"},"apple":{"type":"object","properties":{"#,
+                r#""zulu":{"type":"integer"},"alpha":{"type":"boolean"}}}},"required":["zebra","apple"]}}]}"#,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/messages")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(input))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let forwarded = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(std::str::from_utf8(&forwarded).unwrap(), input);
+        }
+
+        backend_task.abort();
+    }
+
     // =============================
     // Tests for transparent proxy header/availability fixes
     // =============================

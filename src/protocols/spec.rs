@@ -3496,6 +3496,29 @@ mod tests {
         assert!(params.whitespace_pattern.is_none());
     }
 
+    // Schema order affects backend prompt rendering and structured output order.
+    #[test]
+    fn test_response_format_json_schema_preserves_property_order() {
+        let input = concat!(
+            r#"{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object","properties":{"#,
+            r#""zebra":{"type":"string"},"apple":{"type":"integer"},"mango":{"type":"boolean"}}}}}"#,
+        );
+
+        let response_format: ResponseFormat = serde_json::from_str(input).unwrap();
+        assert_eq!(serde_json::to_string(&response_format).unwrap(), input);
+    }
+
+    #[test]
+    fn test_tool_function_parameters_preserves_property_order() {
+        let input = concat!(
+            r#"{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"#,
+            r#""zebra":{"type":"string"},"apple":{"type":"integer"},"mango":{"type":"boolean"}}}}}"#,
+        );
+
+        let tool: Tool = serde_json::from_str(input).unwrap();
+        assert_eq!(serde_json::to_string(&tool).unwrap(), input);
+    }
+
     #[test]
     fn test_structured_outputs_params_with_json_schema() {
         let schema = serde_json::json!({
