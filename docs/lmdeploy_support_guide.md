@@ -745,8 +745,8 @@ Cargo 的默认 `python` feature 保留了原有 PyO3 扩展构建行为；专�
 `lmdeploy-router` 可执行程序，而不是可被 Python `import` 的扩展模块。安装 wheel 后，
 可执行程序会被安装到当前 Python 环境的 `bin/` 目录中。
 
-当前 wheel 元数据限制 Python 版本为 `>=3.10,<3.13`，同时二进制不使用 CPython ABI，因此同一
-个 Linux/CPU 架构的 `py3-none` wheel 可以覆盖 Python 3.10、3.11 和 3.12，无需按 Python
+当前 wheel 元数据限制 Python 版本为 `>=3.10,<3.14`，同时二进制不使用 CPython ABI，因此同一
+个 Linux/CPU 架构的 `py3-none` wheel 可以覆盖 Python 3.10、3.11、3.12 和 3.13，无需按 Python
 小版本分别编译。不同操作系统或 CPU 架构仍然需要分别构建，例如 Linux x86_64 与 Linux
 aarch64 需要两个 wheel。
 
@@ -824,14 +824,14 @@ lmdeploy-router \
   --lmdeploy-rdma-link-type roce
 ```
 
-### 10.4 验证 Python 3.10～3.12
+### 10.4 验证 Python 3.10～3.13
 
-准备好三个 Python 解释器后，可以用同一个 wheel 分别创建环境并检查命令：
+准备好四个 Python 解释器后，可以用同一个 wheel 分别创建环境并检查命令：
 
 ```bash
 WHEEL=dist/lmdeploy_router-0.0.1-py3-none-manylinux_2_17_x86_64.whl
 
-for PYTHON in python3.10 python3.11 python3.12; do
+for PYTHON in python3.10 python3.11 python3.12 python3.13; do
   ENV_DIR=".test-artifacts/wheel/${PYTHON}"
   "${PYTHON}" -m venv "${ENV_DIR}"
   "${ENV_DIR}/bin/python" -m pip install --no-deps "${WHEEL}"
