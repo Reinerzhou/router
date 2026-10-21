@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
 // Import types from spec module
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, ResponseFormat, StringOrArray, UserMessageContent,
-};
+use crate::protocols::spec::{ChatCompletionRequest, ChatMessage, ResponseFormat, StringOrArray};
 
 /// Validation constants for OpenAI API parameters
 pub mod constants {
@@ -638,14 +636,14 @@ impl ChatCompletionRequest {
         for (i, msg) in self.messages.iter().enumerate() {
             if let ChatMessage::User { content, .. } = msg {
                 match content {
-                    UserMessageContent::Text(text) if text.is_empty() => {
+                    serde_json::Value::String(text) if text.is_empty() => {
                         return Err(ValidationError::InvalidValue {
                             parameter: format!("messages[{}].content", i),
                             value: "empty".to_string(),
                             reason: "message content cannot be empty".to_string(),
                         });
                     }
-                    UserMessageContent::Parts(parts) if parts.is_empty() => {
+                    serde_json::Value::Array(parts) if parts.is_empty() => {
                         return Err(ValidationError::InvalidValue {
                             parameter: format!("messages[{}].content", i),
                             value: "empty array".to_string(),
@@ -897,7 +895,7 @@ mod tests {
                 model: Some("gpt-4".to_string()),
                 messages: vec![ChatMessage::User {
                     role: "user".to_string(),
-                    content: UserMessageContent::Text("Hello".to_string()),
+                    content: serde_json::json!("Hello"),
                     name: None,
                 }],
                 input_ids: None,
