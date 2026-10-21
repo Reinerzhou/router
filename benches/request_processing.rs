@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use vllm_router_rs::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
-    PromptInput, SamplingParams, UserMessageContent,
+    PromptInput, SamplingParams,
 };
 
 /// Create a default GenerateRequest for benchmarks with minimal fields set
@@ -153,14 +153,12 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         messages: vec![
             ChatMessage::System {
                 role: "system".to_string(),
-                content: "You are a helpful assistant".to_string(),
+                content: "You are a helpful assistant".into(),
                 name: None,
             },
             ChatMessage::User {
                 role: "user".to_string(),
-                content: UserMessageContent::Text(
-                    "Explain quantum computing in simple terms".to_string(),
-                ),
+                content: "Explain quantum computing in simple terms".into(),
                 name: None,
             },
         ],
@@ -194,7 +192,7 @@ fn create_sample_completion_request() -> CompletionRequest {
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
         role: "system".to_string(),
-        content: "You are a helpful assistant with extensive knowledge.".to_string(),
+        content: "You are a helpful assistant with extensive knowledge.".into(),
         name: None,
     }];
 
@@ -202,12 +200,12 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
     for i in 0..50 {
         messages.push(ChatMessage::User {
             role: "user".to_string(),
-            content: UserMessageContent::Text(format!("Question {}: What do you think about topic number {} which involves complex reasoning about multiple interconnected systems and their relationships?", i, i)),
+            content: format!("Question {}: What do you think about topic number {} which involves complex reasoning about multiple interconnected systems and their relationships?", i, i).into(),
             name: None,
         });
         messages.push(ChatMessage::Assistant {
             role: "assistant".to_string(),
-            content: Some(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i)),
+            content: Some(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i).into()),
             name: None,
             tool_calls: None,
             function_call: None,

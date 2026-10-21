@@ -59,6 +59,8 @@ use std::collections::HashMap;
 // This fixes a bug where serde's untagged enum matching would incorrectly match Assistant
 // messages as System messages (because System only requires role + content, serde tries
 // it first and silently ignores reasoning and other Assistant-specific fields).
+// Keep user/system/assistant/tool content opaque: the backend owns content-block
+// validation, and narrowing these values can silently discard blocks or image options.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ChatMessage {
@@ -70,20 +72,20 @@ pub enum ChatMessage {
     },
     System {
         role: String,
-        content: String,
+        content: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
     User {
         role: String, // "user"
-        content: UserMessageContent,
+        content: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
     Assistant {
         role: String, // "assistant"
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,13 +143,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
             }
             "assistant" => Ok(ChatMessage::Assistant {
                 role: role.to_string(),
-                content: value.get("content").and_then(|c| {
-                    if c.is_null() {
-                        None
-                    } else {
-                        c.as_str().map(String::from)
-                    }
-                }),
+                content: value.get("content").filter(|c| !c.is_null()).cloned(),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -181,9 +177,8 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 role: role.to_string(),
                 content: value
                     .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new())),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -195,11 +190,8 @@ impl<'de> Deserialize<'de> for ChatMessage {
             "user" => {
                 let content = value
                     .get("content")
-                    .map(|c| {
-                        serde_json::from_value(c.clone())
-                            .unwrap_or(UserMessageContent::Text(String::new()))
-                    })
-                    .unwrap_or(UserMessageContent::Text(String::new()));
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new()));
                 Ok(ChatMessage::User {
                     role: role.to_string(),
                     content,
@@ -287,13 +279,6 @@ pub struct StructuredOutputsParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum UserMessageContent {
-    Text(String),
-    Parts(Vec<ContentPart>),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
 pub enum DeveloperMessageContent {
     Text(String),
     Parts(Vec<DeveloperContentPart>),
@@ -313,22 +298,6 @@ pub enum DeveloperContentPart {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PromptCacheBreakpoint {
     pub mode: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum ContentPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "image_url")]
-    ImageUrl { image_url: ImageUrl },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ImageUrl {
-    pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>, // "auto", "low", or "high"
 }
 
 // ============= Response Format Types =============
@@ -3892,11 +3861,45 @@ mod tests {
         let message: ChatMessage = serde_json::from_str(json).unwrap();
 
         match message {
-            ChatMessage::User { content, .. } => match content {
-                UserMessageContent::Text(text) => assert_eq!(text, "Hello!"),
-                _ => panic!("Expected Text content"),
-            },
+            ChatMessage::User { content, .. } => assert_eq!(content, "Hello!"),
             _ => panic!("Expected User message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_preserves_content_blocks() {
+        for role in ["system", "user", "assistant", "tool"] {
+            for content in [
+                serde_json::json!([{"type": "text", "text": "K7M4P2"}]),
+                serde_json::json!([
+                    {"type": "text", "text": "before"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,example",
+                            "detail": "auto",
+                            "min_dynamic_patch": 1,
+                            "max_dynamic_patch": 4
+                        },
+                        "modalities": "multi-images"
+                    },
+                    {"type": "text", "text": "after"},
+                    {"type": "tool_reference", "name": "lookup"}
+                ]),
+                serde_json::json!([
+                    {"type": "thinking", "thinking": "prior reasoning"},
+                    {"type": "text", "text": "K7M4P2"}
+                ]),
+                // Invalid blocks must reach backend validation unchanged too.
+                serde_json::json!([null, "invalid block", {"text": "missing type"}]),
+            ] {
+                let mut input = serde_json::json!({"role": role, "content": content});
+                if role == "tool" {
+                    input["tool_call_id"] = serde_json::json!("call_image");
+                }
+                let message: ChatMessage = serde_json::from_value(input.clone()).unwrap();
+                assert_eq!(serde_json::to_value(message).unwrap(), input);
+            }
         }
     }
 
@@ -3972,7 +3975,7 @@ mod tests {
     fn test_chat_message_roundtrip_serialization() {
         let original = ChatMessage::Assistant {
             role: "assistant".to_string(),
-            content: Some("Hello!".to_string()),
+            content: Some(Value::String("Hello!".to_string())),
             name: None,
             tool_calls: None,
             function_call: None,

@@ -1843,6 +1843,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_chat_proxy_preserves_content_and_backend_errors() {
+        use crate::config::RouterConfig;
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use axum::{routing::post, Router as AxumRouter};
+        use serde_json::{json, Value};
+        use tokio::net::TcpListener;
+        use tower::ServiceExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let backend = AxumRouter::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let unsupported = body["messages"].as_array().unwrap().iter().any(|message| {
+                    message["content"].as_array().is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            !matches!(part["type"].as_str(), Some("text" | "image_url"))
+                        })
+                    })
+                });
+                let status = if unsupported {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::OK
+                };
+                // Echo what reached the worker, including in error responses.
+                (status, Json(body["messages"].clone()))
+            }),
+        );
+        let backend_task = tokio::spawn(async move {
+            axum::serve(listener, backend).await.unwrap();
+        });
+
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router
+            .worker_registry
+            .register(Arc::new(BasicWorker::new(worker_url, WorkerType::Regular)));
+        router.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let context = AppContext::new(
+            RouterConfig::default(),
+            router.client.clone(),
+            4,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            router: Arc::new(router),
+            context: Arc::new(context),
+            concurrency_queue_tx: None,
+            router_manager: None,
+        });
+        let app = build_app_with_request_tracing(state, 1024 * 1024, vec![], vec![], true, false);
+
+        for unsupported in [
+            None,
+            Some("tool_reference"),
+            Some("passthrough_probe"),
+            Some("thinking"),
+        ] {
+            let mut messages = json!([
+                {"role": "system", "content": [{"type": "text", "text": "system code"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "assistant code"}]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "before image"},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64,example", "detail": "auto",
+                        "min_dynamic_patch": 1, "max_dynamic_patch": 4
+                    }, "modalities": "multi-images"},
+                    {"type": "text", "text": "after image"}
+                ]}
+            ]);
+            if let Some(kind) = unsupported {
+                let index = if kind == "thinking" { 1 } else { 2 };
+                messages[index]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                        "type": kind, "name": "lookup", "thinking": "prior reasoning"
+                    }));
+            }
+            let input = json!({"model": "test-model", "messages": messages, "max_tokens": 1});
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/chat/completions")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(input.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let expected_status = if unsupported.is_some() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            };
+            assert_eq!(response.status(), expected_status);
+            let forwarded = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&forwarded).unwrap(),
+                messages
+            );
+        }
+
+        backend_task.abort();
+    }
+
+    #[tokio::test]
     async fn test_messages_proxy_preserves_key_order() {
         use crate::config::RouterConfig;
         use crate::server::{build_app_with_request_tracing, AppContext, AppState};

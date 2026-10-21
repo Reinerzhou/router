@@ -14,7 +14,6 @@ use vllm_router_rs::{
     config::{RouterConfig, RoutingMode},
     protocols::spec::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, PromptInput,
-        UserMessageContent,
     },
     routers::{openai_router::OpenAIRouter, RouterTrait},
 };
@@ -90,7 +89,8 @@ async fn test_openai_router_creation() {
 /// Test health endpoints
 #[tokio::test]
 async fn test_openai_router_health() {
-    let router = OpenAIRouter::new("https://api.openai.com".to_string(), None)
+    let mock_server = MockOpenAIServer::new().await;
+    let router = OpenAIRouter::new(mock_server.base_url(), None)
         .await
         .unwrap();
 
@@ -226,7 +226,7 @@ async fn test_openai_router_chat_completion_with_mock() {
     let mut chat_request = create_minimal_chat_request();
     chat_request.messages = vec![ChatMessage::User {
         role: "user".to_string(),
-        content: UserMessageContent::Text("Hello, how are you?".to_string()),
+        content: json!("Hello, how are you?"),
         name: None,
     }];
     chat_request.temperature = Some(0.7);
