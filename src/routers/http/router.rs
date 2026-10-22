@@ -17,9 +17,7 @@ use axum::body::to_bytes;
 use axum::{
     body::Body,
     extract::Request,
-    http::{
-        header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -816,20 +814,14 @@ impl Router {
                 )
             };
 
-        // Copy all headers from original request if provided, skipping
-        // Content-Type/Content-Length (.json() sets them) and trace headers
-        // (propagate_trace_headers below injects fresh context).
-        if let Some(headers) = headers {
-            for (name, value) in headers {
-                if *name != CONTENT_TYPE
-                    && *name != CONTENT_LENGTH
-                    && !header_utils::TRACE_HEADER_NAMES
-                        .iter()
-                        .any(|&th| name.as_str().eq_ignore_ascii_case(th))
-                {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
+        request_builder = header_utils::forward_request_headers(
+            request_builder,
+            headers,
+            self.api_key.is_some(),
+            extracted_dp_rank.is_some(),
+        );
+        if let Some(ref key) = self.api_key {
+            request_builder = request_builder.header("authorization", format!("Bearer {key}"));
         }
 
         // Add X-data-parallel-rank header for DP-aware routing
@@ -915,9 +907,8 @@ impl Router {
             let worker_url = worker_url.to_string();
 
             // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            // A stream request can receive a JSON error from the backend.
+            let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -969,9 +960,8 @@ impl Router {
         } else {
             // For requests without load tracking, just stream
             // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            // A stream request can receive a JSON error from the backend.
+            let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1676,7 +1666,8 @@ impl RouterTrait for Router {
         }
 
         let policy = self.policy_registry.get_default_policy();
-        let request_text = serde_json::to_string(&body).ok();
+        let request_text = crate::protocols::routing_text::transparent_routing_text(path, &body)
+            .or_else(|| serde_json::to_string(&body).ok());
         let request_headers = Self::headers_to_request_headers(headers);
         let worker_idx = match policy.select_worker_with_headers(
             &workers,
@@ -1723,6 +1714,13 @@ impl RouterTrait for Router {
             request_builder = request_builder.json(&body);
         }
 
+        request_builder = header_utils::forward_request_headers(
+            request_builder,
+            headers,
+            self.api_key.is_some(),
+            worker.dp_rank().is_some(),
+        );
+
         // Add authorization if configured
         if let Some(ref key) = self.api_key {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
@@ -1743,7 +1741,7 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
-                let headers = response.headers().clone();
+                let headers = header_utils::preserve_response_headers(response.headers());
 
                 // Stream the response body
                 let body = Body::from_stream(response.bytes_stream());
@@ -1776,6 +1774,7 @@ impl RouterTrait for Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use std::collections::HashMap;
 
     fn create_test_regular_router() -> Router {
