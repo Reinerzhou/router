@@ -207,7 +207,7 @@ The router supports multiple load balancing policies:
 | `random` | Uniform random selection | No | Simple deployments |
 | `consistent_hash` | Routes same session/user to same worker | Yes | Multi-turn chat, KV cache reuse |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
-| `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
+| `cache_aware` | Routes on repeated prompt prefixes without session IDs | No session required | Multi-turn chat, repeated system prompts |
 
 ```bash
 # Example: Using consistent_hash with HTTP header for session affinity

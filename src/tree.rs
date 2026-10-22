@@ -628,6 +628,11 @@ impl Tree {
 
     #[allow(dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+        take_chars(text, self.prefix_match_tenant_char_count(text, tenant))
+    }
+
+    /// Return one tenant's matched character count without allocating a string.
+    pub fn prefix_match_tenant_char_count(&self, text: &str, tenant: &str) -> usize {
         // Use slice-based traversal - no Vec<char> allocation
 
         // Intern tenant ID once for efficient lookups
@@ -688,8 +693,7 @@ impl Tree {
                 .insert(Arc::clone(&tenant_id), epoch);
         }
 
-        // Build result from original input using char count
-        take_chars(text, matched_chars)
+        matched_chars
     }
 
     /// Return the list of tenants for which this node is a leaf.
@@ -1868,6 +1872,26 @@ mod tests {
         let result = tree.prefix_match_with_counts("hello你好世界");
         assert_eq!(result.matched_char_count, 7); // "hello你好" = 7 chars
         assert_eq!(result.input_char_count, 9); // "hello你好世界" = 9 chars
+    }
+
+    #[test]
+    fn tenant_prefix_match_does_not_count_shared_ancestor_as_longer_match() {
+        let tree = Tree::new();
+        tree.insert("common prefix alpha", "worker1");
+        tree.insert("common prefix beta", "worker2");
+
+        assert_eq!(
+            tree.prefix_match_tenant_char_count("common prefix gamma", "worker1"),
+            "common prefix ".chars().count()
+        );
+        assert_eq!(
+            tree.prefix_match_tenant_char_count("common prefix alpha", "worker1"),
+            "common prefix alpha".chars().count()
+        );
+        assert_eq!(
+            tree.prefix_match_tenant_char_count("common prefix alpha", "worker2"),
+            "common prefix ".chars().count()
+        );
     }
 
     // ==================== Node Splitting Edge Cases ====================

@@ -7,12 +7,11 @@
     2. Load Balancing (Shortest Queue with Balance Thresholds)
 
     The router dynamically switches between these strategies based on load conditions:
-    - Uses load balancing when the system is imbalanced
-    - Uses cache-aware routing when the system is balanced
+    - Preserves the best cache prefix across the fleet unless its holder is hot
+    - Uses active request count among equal cache holders and on cache misses
 
-    A system is considered imbalanced if both conditions are met:
-    1. (max - min) > abs_threshold
-    2. max > rel_threshold * min
+    A cache holder is considered hot when its load exceeds the healthy-worker
+    mean by both the configured absolute and relative margins.
 
     Strategy Details:
 
@@ -25,37 +24,33 @@
     Process:
     a. For each request, find the worker with the highest prefix match
     b. If match rate > cache_threshold:
-    Route to the worker with highest match (likely has relevant data cached)
+    Route to the strongest healthy cache holder, breaking ties by load
     c. If match rate ≤ cache_threshold:
-    Route to the worker with smallest tree size (most available cache capacity)
+    Route to the least-loaded healthy worker and remember the placement
     d. Background maintenance:
     Periodically evict least recently used leaf nodes to prevent memory overflow
 
     2. Load Balancing (Shortest Queue)
     -------------------------------------------
-    This strategy tracks pending request counts per worker and routes new requests
-    to the least busy worker when the system is detected to be imbalanced.
+    Active request counts are a lightweight expected-wait proxy for misses,
+    equal cache matches, and hot-holder spills.
 
     Configuration Parameters:
     ------------------------
     1. cache_threshold: (float, 0.0 to 1.0)
-    Minimum prefix match ratio to use highest-match routing.
-    Below this threshold, routes to worker with most available cache space.
+    Minimum prefix match ratio at which remembered cache affinity is trusted.
 
     2. balance_abs_threshold: (integer)
-    Absolute difference threshold for load imbalance detection.
-    System is potentially imbalanced if (max_load - min_load) > abs_threshold
+    Absolute active-request margin used by the cache-holder spill gate.
 
     3. balance_rel_threshold: (float)
-    Relative ratio threshold for load imbalance detection.
-    System is potentially imbalanced if max_load > min_load * rel_threshold
-    Used in conjunction with abs_threshold to determine final imbalance state.
+    Relative load margin used with balance_abs_threshold by the spill gate.
 
     4. eviction_interval_secs: (integer)
     Interval between LRU eviction cycles for the approximate trees.
 
     5. max_tree_size: (integer)
-    Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
+    Maximum remembered characters per worker in a model tree. When exceeded, LRU leaf nodes are evicted
     during the next eviction cycle.
 */
 
@@ -65,7 +60,6 @@ use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
 use crate::tree::Tree;
 use dashmap::DashMap;
-use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -74,8 +68,8 @@ use tracing::{debug, info};
 
 /// Cache-aware routing policy
 ///
-/// Routes requests based on cache affinity when load is balanced,
-/// switches to shortest-queue routing when load is imbalanced.
+/// Preserves the strongest cache prefix unless its holder is overloaded, and
+/// uses active request count for misses and affinity ties.
 /// Maintains separate trees per model for multi-model support.
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
@@ -170,59 +164,6 @@ impl CacheAwarePolicy {
             );
         }
     }
-
-    fn select_worker_min_load(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-        healthy_indices: &[usize],
-        model_id: &str,
-        max_load: usize,
-        min_load: usize,
-    ) -> Option<usize> {
-        // Log load balancing trigger (only compute worker loads if debug enabled)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
-            debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
-            );
-        }
-
-        RouterMetrics::record_load_balancing_event();
-        RouterMetrics::set_load_range(max_load, min_load);
-
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
-
-        // Even in imbalanced mode, update the tree to maintain cache state
-        if let Some(text) = request_text {
-            // Get the tree reference without locking the entire HashMap
-            // DashMap only locks the specific shard containing this key
-            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-            if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                tree.insert(text, worker_url);
-            } else {
-                debug!(
-                    "Warning: No tree found for model '{}', skipping cache update",
-                    model_id
-                );
-            }
-        }
-
-        // Increment processed counter
-        workers[min_load_idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[min_load_idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
-
-        Some(min_load_idx)
-    }
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
@@ -242,119 +183,111 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // All workers should be from the same model
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
-        // Get current load statistics - compute min/max in single pass without allocation
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
-            (min.min(load), max.max(load))
-        });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        // Metrics describe the same healthy pool considered for selection.
+        let (min_load, max_load) =
+            healthy_indices
+                .iter()
+                .fold((usize::MAX, 0usize), |(min, max), &idx| {
+                    let load = workers[idx].load();
+                    (min.min(load), max.max(load))
+                });
 
-        // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
-
-        debug!(
-            "Load status for model: max_load={}, min_load={}, is_imbalanced={}",
-            max_load, min_load, is_imbalanced
-        );
-
-        if is_imbalanced {
-            return self.select_worker_min_load(
-                workers,
-                request_text,
-                &healthy_indices,
-                model_id,
-                max_load,
-                min_load,
-            );
-        }
-
-        // Use cache-aware routing when balanced
+        // Check cache affinity in both balanced and imbalanced states. Fleet
+        // imbalance alone is not a reason to discard a useful prefix hit;
+        // the selected holder's own load is checked by the spill gate below.
         let text = request_text.unwrap_or("");
 
         // Get the tree reference without locking the entire HashMap
         // DashMap only locks the specific shard containing this key
-        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        let tree = self
+            .trees
+            .entry(model_id.to_string())
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .value()
+            .clone();
 
-        let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
-        debug!("Available tree keys: {:?}", keys);
-
-        let Some(tree) = tree else {
-            // No tree for this model, log warning and use random selection
-            debug!(
-                "Warning: No tree found for model '{}', using random worker selection",
-                model_id
-            );
-            // Return a random healthy worker
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            let selected_idx = healthy_indices[random_idx];
-
-            workers[selected_idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[selected_idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
-
-            return Some(selected_idx);
-        };
         debug!("Using cache-aware routing for model '{}'", model_id);
-        // Now we work with the tree without holding the HashMap lock
-        // Use prefix_match_with_counts to avoid redundant chars().count() calls
-        let result = tree.prefix_match_with_counts(text);
-        let match_rate = if result.input_char_count == 0 {
+        // Compare each healthy worker against its own recorded path. The tree
+        // query is tenant-aware, so a shared ancestor only counts for a worker
+        // if that worker actually owns the matched path.
+        let input_chars = text.chars().count();
+        let matches = healthy_indices
+            .iter()
+            .map(|&idx| {
+                (
+                    idx,
+                    tree.prefix_match_tenant_char_count(text, workers[idx].url()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let best_match_chars = matches.iter().map(|(_, count)| *count).max().unwrap_or(0);
+        let match_rate = if input_chars == 0 {
             0.0
         } else {
-            result.matched_char_count as f32 / result.input_char_count as f32
+            best_match_chars as f32 / input_chars as f32
+        };
+        let matching_holders = if !text.is_empty() && match_rate > self.config.cache_threshold {
+            matches
+                .iter()
+                .filter_map(|(idx, count)| (*count == best_match_chars).then_some(*idx))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
         };
 
         debug!(
-            "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
-            model_id, result.matched_char_count, result.input_char_count, match_rate
+            "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}, holders={}",
+            model_id, best_match_chars, input_chars, match_rate, matching_holders.len()
         );
-        // Select worker without String allocation
-        let selected_idx = if match_rate > self.config.cache_threshold {
-            // Cache hit path: find worker by URL (compare &str directly, no allocation)
-            let tenant_url: &str = &result.tenant;
-            workers
-                .iter()
-                .position(|w| w.url() == tenant_url)
-                .filter(|&idx| workers[idx].is_healthy())
+
+        // Prefer the least-loaded worker among equal best cache holders.
+        // If all best holders are materially hotter than the healthy-worker
+        // mean, deliberately spill to the least-loaded healthy worker.
+        let mut selected_idx = if matching_holders.is_empty() {
+            None
         } else {
-            // Low cache match: use worker with minimum load
-            healthy_indices
+            matching_holders
                 .iter()
                 .min_by_key(|&&idx| workers[idx].load())
                 .copied()
         };
-
-        if let Some(idx) = selected_idx {
-            // Update the tree with this request (use worker URL directly, no allocation)
-            tree.insert(text, workers[idx].url());
-
-            // Increment processed counter
-            workers[idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
-
-            return Some(idx);
-        }
-
-        // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-        if match_rate > self.config.cache_threshold {
-            let tenant_url: &str = &result.tenant;
-            tree.remove_tenant(tenant_url);
-            debug!("Removed stale worker {} from cache tree", tenant_url);
-        }
-
-        // Fallback to first healthy worker
-        if let Some(idx) = healthy_indices.first().copied() {
-            workers[idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
-
-            Some(idx)
+        if let Some(hit_idx) = selected_idx {
+            let total_load: usize = healthy_indices.iter().map(|&i| workers[i].load()).sum();
+            let mean_load = total_load as f32 / healthy_indices.len() as f32;
+            let hit_load = workers[hit_idx].load() as f32;
+            let overloaded = healthy_indices.len() > 1
+                && hit_load > mean_load + self.config.balance_abs_threshold as f32
+                && hit_load > mean_load * self.config.balance_rel_threshold;
+            if overloaded {
+                selected_idx = healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())
+                    .copied();
+                RouterMetrics::record_load_balancing_event();
+                RouterMetrics::set_load_range(max_load, min_load);
+            }
         } else {
-            None
+            // A miss (or too little usable overlap) falls back to the least
+            // expected-wait proxy available in this HTTP-only router: active
+            // request count. We still remember the final placement below.
+            selected_idx = healthy_indices
+                .iter()
+                .min_by_key(|&&idx| workers[idx].load())
+                .copied();
+            RouterMetrics::record_load_balancing_event();
+            RouterMetrics::set_load_range(max_load, min_load);
         }
+
+        let idx = selected_idx?;
+        // Learn the final placement, including spill decisions, for future
+        // turns. Multiple workers may retain the same prefix in the tree.
+        if !text.is_empty() {
+            tree.insert(text, workers[idx].url());
+        }
+        workers[idx].increment_processed();
+        RouterMetrics::record_processed_request(workers[idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
+        Some(idx)
     }
 
     fn name(&self) -> &'static str {
@@ -535,11 +468,84 @@ mod tests {
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
         policy.init_workers(&workers);
 
-        // Should select worker2 (lower load) despite cache affinity
+        // A cache miss should select worker2 (lower load).
         for _ in 0..5 {
             let idx = policy.select_worker(&workers, Some("test")).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    #[test]
+    fn cache_hit_survives_fleet_imbalance_unless_holder_is_hot() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+        let first = BasicWorker::new("http://affinity:8000".to_string(), WorkerType::Regular);
+        let second = BasicWorker::new("http://cold:8000".to_string(), WorkerType::Regular);
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(first), Arc::new(second)];
+        policy.init_workers(&workers);
+
+        // A miss lands on the least-loaded worker and records its placement.
+        assert_eq!(
+            policy.select_worker(&workers, Some("stable prompt prefix")),
+            Some(0)
+        );
+        for _ in 0..20 {
+            workers[1].increment_load();
+        }
+        // Global imbalance alone must not discard the useful cache affinity.
+        assert_eq!(
+            policy.select_worker(&workers, Some("stable prompt prefix")),
+            Some(0)
+        );
+
+        for _ in 0..100 {
+            workers[0].increment_load();
+        }
+        // Once the holder exceeds both spill margins, route to the cool worker.
+        assert_eq!(
+            policy.select_worker(&workers, Some("stable prompt prefix")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn shared_prefix_tie_prefers_less_loaded_holder() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 1000,
+            balance_rel_threshold: 10.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+        let tree = policy.trees.get("default").unwrap().value().clone();
+        tree.insert("common prefix alpha", workers[0].url());
+        tree.insert("common prefix beta", workers[1].url());
+        for _ in 0..3 {
+            workers[0].increment_load();
+        }
+
+        // Both requests share a substantial prefix; among equally strong
+        // holders use active load as the tie breaker.
+        assert_eq!(
+            policy.select_worker(&workers, Some("common prefix gamma")),
+            Some(1)
+        );
     }
 
     #[test]

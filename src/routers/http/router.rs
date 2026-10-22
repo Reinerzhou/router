@@ -26,8 +26,46 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+/// Own the load increment until the response stream ends or is dropped.
+/// Keeping this in stream state also releases load on client cancellation.
+struct ActiveRequestGuard {
+    worker: Arc<dyn Worker>,
+}
+
+impl ActiveRequestGuard {
+    fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self { worker }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.worker.decrement_load();
+        RouterMetrics::set_running_requests(self.worker.url(), self.worker.load());
+    }
+}
+
+fn tracked_response_body(response: reqwest::Response, guard: Option<ActiveRequestGuard>) -> Body {
+    let stream = futures_util::stream::unfold(
+        (response.bytes_stream(), guard),
+        |(mut stream, mut guard)| async move {
+            match stream.next().await {
+                Some(chunk) => {
+                    if chunk.is_err() {
+                        guard.take();
+                    }
+                    Some((chunk, (stream, guard)))
+                }
+                None => None,
+            }
+        },
+    );
+    Body::from_stream(stream)
+}
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -569,20 +607,8 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
-                } else {
-                    false
-                };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
+                let load_guard = (policy.name() == "cache_aware")
+                    .then(|| ActiveRequestGuard::new(worker.clone()));
 
                 let response = self
                     .send_typed_request(
@@ -591,7 +617,7 @@ impl Router {
                         route,
                         worker.url(),
                         is_stream,
-                        load_incremented,
+                        load_guard,
                     )
                     .await;
 
@@ -599,18 +625,6 @@ impl Router {
                 // should count against the circuit breaker.
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
-                }
 
                 response
             },
@@ -769,7 +783,7 @@ impl Router {
         route: &str,
         worker_url: &str,
         is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        load_guard: Option<ActiveRequestGuard>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -848,14 +862,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -879,115 +885,17 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
 
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
-
-            response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
-
-            // Preserve headers for streaming response
-            // A stream request can receive a JSON error from the backend.
-            let response_headers = header_utils::preserve_response_headers(res.headers());
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream and detect completion
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut decremented = false;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
             response
         } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
-            // A stream request can receive a JSON error from the backend.
+            // Preserve the backend media type: a streamed request can still
+            // receive a JSON error rather than an SSE response.
             let response_headers = header_utils::preserve_response_headers(res.headers());
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
+            let mut response = Response::new(tracked_response_body(res, load_guard));
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
             response
@@ -1650,9 +1558,9 @@ impl RouterTrait for Router {
     ) -> Response {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
 
-        // Select a worker (filter by availability like select_worker_for_model)
-        let all_workers = self.worker_registry.get_all();
-        let workers: Vec<Arc<dyn Worker>> = all_workers
+        let workers: Vec<Arc<dyn Worker>> = self
+            .worker_registry
+            .get_all()
             .iter()
             .filter(|w| w.is_available())
             .cloned()
@@ -1726,6 +1634,9 @@ impl RouterTrait for Router {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
 
+        let load_guard = (policy.name() == "cache_aware")
+            .then(|| ActiveRequestGuard::new(workers[worker_idx].clone()));
+
         // Send request
         match otel_http::send_client_request(
             request_builder,
@@ -1743,8 +1654,9 @@ impl RouterTrait for Router {
                 let status = response.status();
                 let headers = header_utils::preserve_response_headers(response.headers());
 
-                // Stream the response body
-                let body = Body::from_stream(response.bytes_stream());
+                // Own the guard in the stream, not in an independent forwarding
+                // task: EOF, read errors, and dropped response bodies all release it.
+                let body = tracked_response_body(response, load_guard);
                 let mut response_builder = Response::builder().status(status.as_u16());
 
                 for (name, value) in headers.iter() {
@@ -1776,6 +1688,231 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use std::collections::HashMap;
+
+    fn transparent_router(url: String) -> (Router, Arc<dyn Worker>) {
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.3,
+                balance_abs_threshold: 0,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 10000,
+            },
+        ));
+        router.client = Client::builder().no_proxy().build().unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+        router.worker_registry.register(worker.clone());
+        (router, worker)
+    }
+
+    async fn transparent_backend() -> (String, tokio::task::JoinHandle<()>) {
+        async fn handle(headers: HeaderMap, Json(body): Json<serde_json::Value>) -> Response {
+            if body["mode"] == "slow_headers" {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            if body["mode"] == "pending" {
+                let stream = futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: opening\n\n"))
+                })
+                .chain(futures_util::stream::pending());
+                return Response::new(Body::from_stream(stream));
+            }
+            if body["mode"] == "error_status" {
+                return (StatusCode::SERVICE_UNAVAILABLE, "upstream unavailable").into_response();
+            }
+            Json(serde_json::json!({
+                "anthropic-version": headers.get("anthropic-version").and_then(|v| v.to_str().ok()),
+                "x-api-key": headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+                "body": body
+            }))
+            .into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(handle);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn transparent_response_lifetime_and_headers() {
+        let (url, server) = transparent_backend().await;
+        let (router, worker) = transparent_router(url);
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        headers.insert("x-api-key", "test-key".parse().unwrap());
+        for path in ["/v1/responses", "/v1/messages"] {
+            let response = router
+                .route_transparent(
+                    Some(&headers),
+                    path,
+                    &Method::POST,
+                    serde_json::json!({"input":"hello", "messages":[]}),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(worker.load(), 1);
+            let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+            let echoed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(echoed["anthropic-version"], "2023-06-01");
+            assert_eq!(echoed["x-api-key"], "test-key");
+            assert_eq!(
+                echoed["body"],
+                serde_json::json!({"input":"hello", "messages":[]})
+            );
+            assert_eq!(worker.load(), 0);
+
+            let response = router
+                .route_transparent(
+                    None,
+                    path,
+                    &Method::POST,
+                    serde_json::json!({"mode":"pending", "stream":true}),
+                )
+                .await;
+            assert_eq!(worker.load(), 1);
+            drop(response); // disconnect before consuming the stream
+            assert_eq!(worker.load(), 0);
+
+            let response = router
+                .route_transparent(
+                    None,
+                    path,
+                    &Method::POST,
+                    serde_json::json!({"mode":"pending", "stream":true}),
+                )
+                .await;
+            let mut stream = response.into_body().into_data_stream();
+            assert!(stream.next().await.unwrap().is_ok());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), stream.next())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(worker.load(), 1);
+            drop(stream); // disconnect while waiting for the next chunk
+            assert_eq!(worker.load(), 0);
+
+            let response = router
+                .route_transparent(
+                    None,
+                    path,
+                    &Method::POST,
+                    serde_json::json!({"mode":"error_status"}),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            to_bytes(response.into_body(), 16384).await.unwrap();
+            assert_eq!(worker.load(), 0);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transparent_cancellation_and_connect_failure_release_load() {
+        let (url, server) = transparent_backend().await;
+        let (mut router, worker) = transparent_router(url);
+        for path in ["/v1/responses", "/v1/messages"] {
+            let result = tokio::time::timeout(
+                Duration::from_millis(50),
+                router.route_transparent(
+                    None,
+                    path,
+                    &Method::POST,
+                    serde_json::json!({"mode":"slow_headers"}),
+                ),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(worker.load(), 0);
+        }
+        server.abort();
+        // Binding then dropping yields a local refused connection without DNS/proxy dependencies.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let (failed_router, failed_worker) = transparent_router(unused);
+        router = failed_router;
+        let response = router
+            .route_transparent(
+                None,
+                "/v1/responses",
+                &Method::POST,
+                serde_json::json!({"input":"hello"}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(failed_worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn transparent_truncated_body_releases_load() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            stream.read(&mut buffer).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx")
+                .await
+                .unwrap();
+        });
+        let (router, worker) = transparent_router(url);
+        let response = router
+            .route_transparent(
+                None,
+                "/v1/messages",
+                &Method::POST,
+                serde_json::json!({"messages":[]}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), 16384).await.is_err());
+        assert_eq!(worker.load(), 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_load_guards_do_not_release_other_requests() {
+        let (url, server) = transparent_backend().await;
+        let (mut router, worker) = transparent_router(url);
+        router.retry_config.max_retries = 1;
+        worker.increment_load(); // another request is still running
+        let error: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages":[{"role":"user", "content":"hello"}], "mode":"error_status"
+        }))
+        .unwrap();
+        let response = router
+            .route_typed_request(None, &error, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            worker.load(),
+            1,
+            "retry cleanup must not decrement another request"
+        );
+
+        let streaming: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages":[{"role":"user", "content":"hello"}], "mode":"pending", "stream":true
+        }))
+        .unwrap();
+        let response = router
+            .route_typed_request(None, &streaming, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(worker.load(), 2);
+        let mut stream = response.into_body().into_data_stream();
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+        assert_eq!(worker.load(), 1);
+        worker.decrement_load();
+        server.abort();
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
