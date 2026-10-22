@@ -8,8 +8,8 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         spec::{
-            ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            InferenceGenerateRequest, RerankRequest, V1RerankReqInput,
+            ChatCompletionRequest, CompletionRequest, EmbeddingRequest, ErrorDetail, ErrorResponse,
+            GenerateRequest, InferenceGenerateRequest, RerankRequest, V1RerankReqInput,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -20,7 +20,7 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -44,6 +44,9 @@ use tokio::{
     sync::{Mutex, RwLock},
 };
 use tracing::{error, info, warn, Level};
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone)]
 pub struct AppContext {
@@ -166,6 +169,42 @@ async fn sink_handler() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
+/// Normalize client JSON errors without changing body-read failures such as 413.
+fn openai_json_rejection(rejection: JsonRejection) -> Response {
+    match rejection {
+        JsonRejection::JsonDataError(_)
+        | JsonRejection::JsonSyntaxError(_)
+        | JsonRejection::MissingJsonContentType(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: ErrorDetail {
+                    message: rejection.body_text(),
+                    error_type: "invalid_request_error".to_string(),
+                    param: None,
+                    code: None,
+                },
+            }),
+        )
+            .into_response(),
+        _ => rejection.into_response(),
+    }
+}
+
+fn transparent_request_error(path: &str, message: String) -> Response {
+    if matches!(path, "/v1/messages" | "/v1/messages/count_tokens") {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": message},
+            })),
+        )
+            .into_response()
+    } else {
+        (StatusCode::BAD_REQUEST, message).into_response()
+    }
+}
+
 /// Transparent proxy handler for unmatched routes
 /// Routes requests through the router's route_transparent method
 async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -184,11 +223,7 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read request body: {}", e),
-            )
-                .into_response()
+            return transparent_request_error(&path, format!("Failed to read request body: {}", e));
         }
     };
 
@@ -199,8 +234,7 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
         match serde_json::from_slice(&body_bytes) {
             Ok(json) => json,
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("Invalid JSON body: {}", e))
-                    .into_response()
+                return transparent_request_error(&path, format!("Invalid JSON body: {}", e));
             }
         }
     };
@@ -311,8 +345,12 @@ async fn inference_generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    body: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return openai_json_rejection(rejection),
+    };
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
@@ -420,8 +458,12 @@ async fn v1_rerank(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return openai_json_rejection(rejection),
+    };
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }

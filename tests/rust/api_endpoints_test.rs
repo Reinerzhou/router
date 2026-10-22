@@ -1701,8 +1701,11 @@ mod error_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        // Axum validates JSON schema - returns 422 for validation errors
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.headers()[CONTENT_TYPE], "application/json");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error");
 
         ctx.shutdown().await;
     }
