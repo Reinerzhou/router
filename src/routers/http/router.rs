@@ -582,7 +582,24 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let text = if route == "/v1/chat/completions" && policy.name() != "cache_aware" {
+            // Keep the pre-existing session key for hash policies.
+            serde_json::to_value(typed_req)
+                .ok()
+                .and_then(|body| {
+                    body.pointer("/session_params/session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default()
+        } else {
+            typed_req.extract_text_for_routing()
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1574,8 +1591,12 @@ impl RouterTrait for Router {
         }
 
         let policy = self.policy_registry.get_default_policy();
-        let request_text = crate::protocols::routing_text::transparent_routing_text(path, &body)
-            .or_else(|| serde_json::to_string(&body).ok());
+        let request_text = if policy.name() == "cache_aware" {
+            crate::protocols::routing_text::transparent_routing_text(path, &body)
+                .or_else(|| serde_json::to_string(&body).ok())
+        } else {
+            serde_json::to_string(&body).ok()
+        };
         let request_headers = Self::headers_to_request_headers(headers);
         let worker_idx = match policy.select_worker_with_headers(
             &workers,

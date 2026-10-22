@@ -224,18 +224,18 @@ vllm-router --policy cache_aware \
 | Parameter | Rust config default | CLI default | Description |
 |-----------|---------------------|-------------|-------------|
 | `cache_threshold` | 0.5 | 0.3 | Best prefix match ratio must exceed this value |
-| `balance_abs_threshold` | 32 | 64 | Spill requires hit load > healthy mean + this margin |
-| `balance_rel_threshold` | 1.1 | 1.5 | Spill also requires hit load > healthy mean × this ratio |
+| `balance_abs_threshold` | 32 | 64 | Spill requires hit load > least-loaded worker + this margin |
+| `balance_rel_threshold` | 1.1 | 1.5 | Spill also requires hit load > least-loaded worker × this ratio |
 | `eviction_interval_secs` | 30 | 120 | Interval for approximate tree eviction |
 | `max_tree_size` | 10000 | 67108864 | Remembered character budget per worker in each model tree |
 
-The spill thresholds now compare the chosen holder against the healthy-worker mean, rather than switching the whole fleet based on max/min load. With two workers the holder/mean ratio is at most 2; a relative threshold of 2 or more prevents this spill condition from firing.
+The spill thresholds compare the chosen cache holder with the least-loaded healthy worker, allowing an idle new worker to receive traffic when existing cache holders are heavily loaded.
 
 ### Behavior
 
 1. Query each healthy worker's longest remembered prompt-prefix match.
 2. If the best match exceeds `cache_threshold`, preserve affinity. If several workers have the same best match, choose the one with the lowest active-request count.
-3. If the best holder is substantially hotter than the healthy-worker mean, spill to the least-loaded worker and record that placement for later turns.
+3. If the best holder is substantially hotter than the least-loaded healthy worker, spill to that worker and record that placement for later turns.
 4. On a miss or short match, choose the least-loaded worker and record the placement.
 
 The active-request count is only a rough load estimate; this HTTP path does not have SMG's scheduler-derived expected-wait or KV-pressure signals. The placement tree learns from routing decisions and can be inaccurate after failures, cache eviction, or worker restarts.

@@ -587,14 +587,8 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        let messages = serde_json::to_value(&self.messages).unwrap_or(Value::Null);
-        let mut parts = Vec::new();
-        if let Some(tools) = &self.tools {
-            let tools = serde_json::to_value(tools).unwrap_or(Value::Null);
-            crate::protocols::routing_text::append_tool_schemas(&mut parts, &tools);
-        }
-        crate::protocols::routing_text::append_chat_messages(&mut parts, &messages);
-        parts.join("\n")
+        let body = serde_json::to_value(self).unwrap_or(Value::Null);
+        crate::protocols::routing_text::conservative_key(&body, "messages")
     }
 }
 

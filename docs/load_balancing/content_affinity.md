@@ -8,9 +8,9 @@ This applies to `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` when
 
 ## From request to worker
 
-1. Build a stable key from prompt fields. Preserve order and message boundaries. Ignore session IDs, request IDs, sampling controls and request metadata.
+1. Build a conservative key: the full prompt-rendering configuration and first input item must match before any prefix counts. Later input items are compared as complete units. Ignore session IDs, request IDs, sampling controls and request metadata.
 2. Compare that key with the approximate radix-tree paths recorded for each healthy worker. A prefix counts for a worker only if that worker owns the matched path. The best match must exceed `cache_threshold`.
-3. On a usable hit, choose the least busy worker among equal best holders. Spill to the least busy healthy worker only when the chosen holder exceeds **both** the absolute and relative load margins above the healthy-worker mean.
+3. On a usable hit, choose the least busy worker among equal best holders. Spill to the least busy healthy worker only when the chosen holder exceeds **both** the absolute and relative load margins above that worker.
 4. On a miss, choose the least busy healthy worker. Record the final placement for later requests. In-flight request counts supply the load estimate, and periodic eviction bounds the remembered tree size per worker.
 
 The tree records routing decisions, not actual engine KV ownership. A matched key means a chance to reuse a prefix. Eviction, failed requests, differing chat templates, hidden server state and context truncation can all make that estimate stale. This is the text-prefix part of the SMG-inspired approach; no engine KV-event feed is required or implemented here.
@@ -19,13 +19,17 @@ The tree records routing decisions, not actual engine KV ownership. A matched ke
 
 | Endpoint | Included in the key | Deliberately excluded |
 |---|---|---|
-| Chat Completions | Ordered tool schemas; ordered message roles, names, reasoning, content, tool calls and results | `session_params.session_id`, sampling options, metadata |
-| Responses | `instructions`; ordered tool schemas; explicit `input` text, messages, function calls/results and other visible input items | `previous_response_id`, sampling options, metadata |
-| Messages | `system`; ordered tool schemas; ordered messages and nested content blocks | Sampling options, metadata |
+| Chat Completions | Full rendering configuration, including `tools`, `tool_choice` and `chat_template_kwargs`; ordered complete `messages` | `session_params.session_id`, sampling options, metadata |
+| Responses | Full rendering configuration, including `instructions` and `tools`; ordered complete explicit `input` items | Sampling options, metadata |
+| Messages | Full rendering configuration, including `system` and `tools`; ordered complete `messages` | Sampling options, metadata |
 
-Strings are JSON escaped without trimming. Message and array boundaries are explicit; object keys are processed in a stable order. Tool order is retained because a backend template may render different orders differently. Inline data URLs and base64 image payloads are represented by short hashes in the key; URLs and file IDs remain visible references. The backend still receives the original media bytes.
+Each complete item and the rendering configuration are guarded by a hash before their diagnostic text is appended to the key. This deliberately gives up reuse within a changed item: key field order cannot safely stand in for model-specific chat-template order. Unknown request options are kept in the rendering configuration, so different values do not share an affinity key. Inline data URLs and base64 image payloads are represented by short hashes in the diagnostic text; the backend still receives the original media bytes.
 
-Responses requests that rely on `previous_response_id` or `item_reference` can refer to history absent from the current request. The router does not bind response IDs to workers, so affinity for backend-held conversation state is not guaranteed. For stateless content affinity, send the relevant history explicitly, commonly with `store=false`. A request containing only `previous_response_id` has an empty content key and follows the miss path.
+For Responses, per-message `id`, `prompt_cache_key` and `client_metadata` are excluded: clients such as Codex change them between calls without changing the rendered prompt. `tool_choice` and other rendering options remain part of the configuration guard.
+
+Responses requests using `previous_response_id`, `conversation` or an `item_reference` can refer to history absent from the current request. They receive an empty content key and follow the miss path. The router does not bind response IDs to workers; for content affinity, send the relevant history explicitly, commonly with `store=false`.
+
+The new content key applies only to `cache_aware`. Chat requests under other policies retain their previous session-ID routing input; transparent routes under other policies retain the serialized request body.
 
 ## HTTP and request lifetime
 
@@ -35,20 +39,14 @@ With `cache_aware`, all three paths count an active request while upstream work 
 
 ## Verification and measured result
 
-The regression cases in `routing_text.rs`, `header_utils.rs`, `router.rs` and `cache_aware.rs` cover key stability and differences, nested media, header forwarding, cancellation, stream errors, concurrent load guards and hit/spill selection. These cases are source-level checks; the H200 run below exercised the assembled service.
+The tested release binary has SHA256 `923c5a495d377e885f616a75bcf4dbeb737223588890c93f6b1d4622fdfaedd8`. The single H200 acceptance run uses two independent vLLM 0.28.0 workers on one GPU, Qwen2.5-7B-Instruct, two seeds, 16 prompt families, four rounds of explicit conversation history, and concurrency 8. Each condition restarts the stack. Groups A and B compare `cache_aware` with `round_robin`; group D keeps `cache_aware` but disables vLLM automatic prefix caching (APC).
 
-On 2026-10-21, two independent vLLM 0.28.0 workers shared one H200 GPU and served Qwen2.5-7B-Instruct through this router. Each condition restarted the stack to clear caches. Three seeds used 16 prompt families, four rounds of full conversation history and concurrency 8. All 33 supported conditions completed: **2,112/2,112** workload requests succeeded. Direct-worker and router smoke requests succeeded for all three endpoints. Local Codex CLI through Responses and Claude CLI through Messages each completed one Router-backed request.
+All 18 conditions and 1,152 formal requests succeeded. The table reports the mean token cache-hit ratio across two seeds and the median of each seed's warm p50 time to first nonempty text token (TTFT). A uses `cache_aware`, B uses `round_robin`, and D uses `cache_aware` with vLLM APC disabled.
 
-The measured current-router binary has SHA256 `1d9a3b26391cdb5e0a4c815bdd5262a22664355ad5c0065b47d0fad417b0d5e9`. The later DP-rank forwarding, streaming error media-type and load-metric cleanups were compile checked but were not part of that GPU run.
+| Endpoint | A hit / warm TTFT | B hit / warm TTFT | D warm TTFT |
+|---|---:|---:|---:|
+| Chat Completions | 68.4% / 55.2 ms | 51.9% / 139.5 ms | 380.6 ms |
+| Responses | 69.1% / 51.4 ms | 47.1% / 140.2 ms | 364.3 ms |
+| Messages | 68.3% / 51.2 ms | 52.9% / 119.2 ms | 351.4 ms |
 
-The table reports the mean token cache-hit ratio across three seeds and the median of each seed's p50 time to first token (TTFT, milliseconds). `A` is current `cache_aware`; `B` is current `round_robin`; `C` is the `9ffe129` cache-aware baseline.
-
-| Endpoint | A hit | B hit | C hit | A TTFT p50 | B TTFT p50 | C TTFT p50 |
-|---|---:|---:|---:|---:|---:|---:|
-| Chat Completions | 72.0% | 54.0% | 51.4% | 58.3 | 154.9 | 155.7 |
-| Responses | 74.1% | 56.0% | 50.6% | 56.6 | 143.0 | 109.4 |
-| Messages | 72.5% | 50.5% | unsupported | 54.5 | 141.6 | — |
-
-A fourth condition disabled vLLM prefix caching. Its warm p50 TTFT was 321.4, 338.0 and 298.5 ms for Chat, Responses and Messages, versus 53.6, 51.3 and 51.9 ms with A. This supports the cache-reuse interpretation for this workload. The Responses baseline had a lower p95 than A in this run, so these results do not establish a tail-latency improvement.
-
-The experiment used one GPU for both workers and a fixed synthetic workload. It demonstrates request compatibility and affinity under these conditions; it does not measure multi-node throughput or production cache distributions. The local experiment record is `affinity-experiments/results/h200-20261021/REPORT.md` in the parent workspace.
+Local Codex and Claude requests also checked real Responses and Messages prefix matching. All six seed/shared/control requests succeeded. Repeating the complete input produced 1,438 more matched characters for Codex and 2,382 more for Claude than each control. `matched_chars` is a router text-prefix measure, not actual engine KV hits. These results describe a single-GPU, two-process synthetic workload; they do not measure Mooncake, DP ranks or production tail latency. The raw records and detailed method are in the separately delivered `affinity-experiments/results/h200-9bf6328-2seeds/REPORT.md`.

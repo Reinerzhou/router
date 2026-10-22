@@ -10,8 +10,8 @@
     - Preserves the best cache prefix across the fleet unless its holder is hot
     - Uses active request count among equal cache holders and on cache misses
 
-    A cache holder is considered hot when its load exceeds the healthy-worker
-    mean by both the configured absolute and relative margins.
+    A cache holder is considered hot when its load exceeds the least-loaded
+    healthy worker by both the configured absolute and relative margins.
 
     Strategy Details:
 
@@ -241,8 +241,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         );
 
         // Prefer the least-loaded worker among equal best cache holders.
-        // If all best holders are materially hotter than the healthy-worker
-        // mean, deliberately spill to the least-loaded healthy worker.
+        // If all best holders are materially hotter than the least-loaded
+        // healthy worker, deliberately spill to that worker.
         let mut selected_idx = if matching_holders.is_empty() {
             None
         } else {
@@ -252,12 +252,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 .copied()
         };
         if let Some(hit_idx) = selected_idx {
-            let total_load: usize = healthy_indices.iter().map(|&i| workers[i].load()).sum();
-            let mean_load = total_load as f32 / healthy_indices.len() as f32;
             let hit_load = workers[hit_idx].load() as f32;
             let overloaded = healthy_indices.len() > 1
-                && hit_load > mean_load + self.config.balance_abs_threshold as f32
-                && hit_load > mean_load * self.config.balance_rel_threshold;
+                && hit_load > min_load as f32 + self.config.balance_abs_threshold as f32
+                && hit_load > min_load as f32 * self.config.balance_rel_threshold;
             if overloaded {
                 selected_idx = healthy_indices
                     .iter()
@@ -545,6 +543,37 @@ mod tests {
         assert_eq!(
             policy.select_worker(&workers, Some("common prefix gamma")),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn idle_new_worker_receives_hot_prefix_traffic() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let tree = policy.trees.get("default").unwrap().value().clone();
+        for worker in workers.iter().take(2) {
+            tree.insert("shared hot prefix", worker.url());
+            for _ in 0..1000 {
+                worker.increment_load();
+            }
+        }
+        assert_eq!(
+            policy.select_worker(&workers, Some("shared hot prefix")),
+            Some(2)
         );
     }
 

@@ -7,92 +7,116 @@
 use serde_json::Value;
 
 pub(crate) fn transparent_routing_text(path: &str, body: &Value) -> Option<String> {
-    let mut parts = Vec::new();
     match path {
         "/v1/responses" => {
-            if let Some(instructions) = body.get("instructions") {
-                append_labeled(&mut parts, "instructions", instructions);
+            // Backend-held history is invisible to this router. Never infer a
+            // cache prefix from only the visible tail of such a request.
+            if body
+                .get("previous_response_id")
+                .is_some_and(|v| !v.is_null())
+                || body.get("conversation").is_some_and(|v| !v.is_null())
+                || body.get("input").is_some_and(has_item_reference)
+            {
+                return Some(String::new());
             }
-            if let Some(tools) = body.get("tools") {
-                append_tool_schemas(&mut parts, tools);
-            }
-            if let Some(input) = body.get("input") {
-                append_responses_input(&mut parts, input);
-            }
-        }
-        "/v1/messages" => {
-            if let Some(system) = body.get("system") {
-                append_labeled(&mut parts, "system", system);
-            }
-            if let Some(tools) = body.get("tools") {
-                append_tool_schemas(&mut parts, tools);
-            }
-            if let Some(messages) = body.get("messages") {
-                append_chat_messages(&mut parts, messages);
-            }
-        }
-        _ => return None,
-    }
-    // A recognized endpoint with no extractable text must stay an empty key;
-    // serializing the whole body would accidentally route on session IDs,
-    // request IDs, sampling controls, or arbitrary metadata.
-    Some(parts.join("\n"))
-}
-
-pub(crate) fn append_chat_messages(parts: &mut Vec<String>, messages: &Value) {
-    let Some(messages) = messages.as_array() else {
-        return;
-    };
-    for message in messages {
-        append_message(parts, message);
-    }
-}
-
-fn append_message(parts: &mut Vec<String>, message: &Value) {
-    parts.push("message".to_string());
-    // Keep role before text, so equal text from different roles doesn't look
-    // like a full prompt-prefix hit. Escape strings and delimit messages.
-    for field in [
-        "role",
-        "name",
-        "reasoning",
-        "content",
-        "tool_calls",
-        "function_call",
-        "tool_call_id",
-    ] {
-        if let Some(value) = message.get(field) {
-            append_labeled(parts, field, value);
-        }
-    }
-    parts.push("end-message".to_string());
-}
-
-fn append_responses_input(parts: &mut Vec<String>, input: &Value) {
-    match input {
-        Value::String(_) => append_labeled(parts, "input", input),
-        Value::Array(items) => {
-            for item in items {
-                if item.get("role").is_some() {
-                    append_message(parts, item);
-                } else {
-                    // Retain function calls/results and opaque references as
-                    // structured input; references don't reveal hidden history.
-                    append_labeled(parts, "input_item", item);
+            let mut visible = body.clone();
+            if let Some(items) = visible.get_mut("input").and_then(Value::as_array_mut) {
+                for item in items {
+                    if item.get("type").and_then(Value::as_str) == Some("message") {
+                        if let Some(fields) = item.as_object_mut() {
+                            fields.remove("id"); // Response item ID does not render into the prompt.
+                        }
+                    }
                 }
             }
+            Some(conservative_key(&visible, "input"))
         }
-        _ => {}
+        "/v1/messages" => Some(conservative_key(body, "messages")),
+        _ => None,
     }
 }
 
-pub(crate) fn append_tool_schemas(parts: &mut Vec<String>, tools: &Value) {
-    let Some(tools) = tools.as_array() else {
-        return;
+pub(crate) fn conservative_key(body: &Value, prompt_field: &str) -> String {
+    let Some(items) = body.get(prompt_field) else {
+        return String::new();
     };
-    for tool in tools {
-        // Template rendering can depend on tool order and type.
-        append_labeled(parts, "tool_schema", tool);
+    let messages = match items {
+        Value::Array(items) => items.iter().collect::<Vec<_>>(),
+        Value::Null => return String::new(),
+        item => vec![item],
+    };
+    let Some(first) = messages.first() else {
+        return String::new();
+    };
+
+    // A full rendering configuration and a full first message must agree
+    // before any prefix is counted. This prevents long tools or arguments
+    // serialized in a different order from masquerading as a prompt prefix.
+    let mut config = body.clone();
+    if let Some(fields) = config.as_object_mut() {
+        fields.remove(prompt_field);
+        for field in [
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "min_tokens",
+            "n",
+            "stream",
+            "stream_options",
+            "seed",
+            "stop",
+            "stop_sequences",
+            "stop_token_ids",
+            "presence_penalty",
+            "frequency_penalty",
+            "repetition_penalty",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "metadata",
+            "user",
+            "session_id",
+            "session_params",
+            "request_id",
+            "store",
+            "service_tier",
+            "prompt_cache_key",
+            "client_metadata",
+        ] {
+            fields.remove(field);
+        }
+    }
+    use std::hash::{Hash, Hasher};
+    let hash = |value: &Value| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.to_string().hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    };
+    let mut first_group = serde_json::Map::new();
+    first_group.insert("config".to_string(), config.clone());
+    first_group.insert("first".to_string(), (*first).clone());
+    let mut parts = vec![hash(&Value::Object(first_group))];
+    append_labeled(&mut parts, "config", &config);
+    append_labeled(&mut parts, "message", first);
+    for message in messages.iter().skip(1) {
+        parts.push(hash(message));
+        append_labeled(&mut parts, "message", message);
+    }
+    parts.join("\n")
+}
+
+fn has_item_reference(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(has_item_reference),
+        Value::Object(fields) => {
+            fields.get("type").and_then(Value::as_str) == Some("item_reference")
+                || fields.values().any(has_item_reference)
+        }
+        _ => false,
     }
 }
 
@@ -199,10 +223,14 @@ mod tests {
             {"role":"user", "content":"continue"}
         ]));
         assert!(next.starts_with(&first));
-        let mut a = Vec::new();
-        let mut b = Vec::new();
-        append_tool_schemas(&mut a, &serde_json::json!([{"name":"a"},{"name":"b"}]));
-        append_tool_schemas(&mut b, &serde_json::json!([{"name":"b"},{"name":"a"}]));
+        let a = conservative_key(
+            &serde_json::json!({"tools":[{"name":"a"},{"name":"b"}], "messages":[{"role":"user","content":"hello"}]}),
+            "messages",
+        );
+        let b = conservative_key(
+            &serde_json::json!({"tools":[{"name":"b"},{"name":"a"}], "messages":[{"role":"user","content":"hello"}]}),
+            "messages",
+        );
         assert_ne!(a, b);
     }
 
@@ -262,9 +290,8 @@ mod tests {
     }
 
     #[test]
-    fn responses_affinity_uses_visible_context_and_ignores_previous_response_id() {
+    fn responses_affinity_requires_explicit_history() {
         let body = serde_json::json!({
-            "previous_response_id": "resp_123",
             "instructions": "Be concise",
             "input": "What is 2 + 2?",
             "temperature": 0.2,
@@ -273,10 +300,9 @@ mod tests {
         let key = transparent_routing_text("/v1/responses", &body).unwrap();
         assert!(key.contains("Be concise"));
         assert!(key.contains("What is 2 + 2?"));
-        assert!(!key.contains("resp_123"));
         assert!(!key.contains("ignored"));
 
-        let id_only = serde_json::json!({"previous_response_id": "resp_123"});
+        let id_only = serde_json::json!({"previous_response_id": "resp_123", "input": "continue"});
         assert_eq!(
             transparent_routing_text("/v1/responses", &id_only),
             Some(String::new())
@@ -325,5 +351,68 @@ mod tests {
         assert_ne!(first, second);
         assert!(!first.contains("image-one"));
         assert!(first.contains("image/png"));
+    }
+
+    #[test]
+    fn changed_system_or_tool_call_name_cannot_match_long_later_fields() {
+        let tools = serde_json::json!([{"name":"lookup", "description":"x".repeat(10_000)}]);
+        let make = |system: &str| {
+            conservative_key(
+                &serde_json::json!({
+                    "tools":tools, "messages":[{"role":"system", "content":system}]
+                }),
+                "messages",
+            )
+        };
+        let first = make("A");
+        let second = make("B");
+        assert_ne!(first.lines().next(), second.lines().next());
+
+        let call = |name: &str| {
+            conservative_key(
+                &serde_json::json!({
+                    "messages":[{"role":"assistant", "tool_calls":[{
+                        "type":"function", "function":{"name":name, "arguments":"x".repeat(10_000)}
+                    }]}]
+                }),
+                "messages",
+            )
+        };
+        assert_ne!(call("first").lines().next(), call("second").lines().next());
+    }
+
+    #[test]
+    fn prompt_configuration_isolated_and_hidden_responses_history_is_a_miss() {
+        let make = |choice: &str| {
+            conservative_key(
+                &serde_json::json!({
+                    "tools":[{"name":"lookup"}], "tool_choice":choice,
+                    "messages":[{"role":"user", "content":"same"}]
+                }),
+                "messages",
+            )
+        };
+        assert_ne!(make("none").lines().next(), make("auto").lines().next());
+        for body in [
+            serde_json::json!({"previous_response_id":"resp_A", "input":"continue"}),
+            serde_json::json!({"conversation":"conv_A", "input":"continue"}),
+            serde_json::json!({"input":[{"type":"item_reference", "id":"item_A"}]}),
+        ] {
+            assert_eq!(
+                transparent_routing_text("/v1/responses", &body),
+                Some(String::new())
+            );
+        }
+        let response = |id: &str| {
+            transparent_routing_text(
+                "/v1/responses",
+                &serde_json::json!({
+                    "prompt_cache_key":id, "client_metadata":{"request_id":id},
+                    "input":[{"type":"message", "role":"user", "id":id,
+                        "content":[{"type":"input_text", "text":"same prompt"}]}]
+                }),
+            )
+        };
+        assert_eq!(response("item_A"), response("item_B"));
     }
 }
