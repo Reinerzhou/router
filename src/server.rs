@@ -311,6 +311,22 @@ async fn v1_responses(
         .await
 }
 
+/// Anthropic Messages API: transparent proxy with cache-aware affinity.
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state
+        .router
+        .route_transparent(Some(&headers), "/v1/messages", &http::Method::POST, body)
+        .await
+}
+
 async fn v1_embeddings(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -726,6 +742,7 @@ pub fn build_app_with_request_tracing(
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
+        .route("/v1/messages", post(v1_messages))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(

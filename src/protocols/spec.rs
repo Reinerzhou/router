@@ -587,19 +587,8 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Use session_id from session_params for session-based routing
-        if let Some(ref session_params) = self.session_params {
-            if let Some(session_id) = session_params.get("session_id") {
-                if let Some(session_id_str) = session_id.as_str() {
-                    if !session_id_str.trim().is_empty() {
-                        return session_id_str.to_string();
-                    }
-                }
-            }
-        }
-
-        // Return empty string if no session_id - let routing policy handle this case
-        String::new()
+        let body = serde_json::to_value(self).unwrap_or(Value::Null);
+        crate::protocols::routing_text::conservative_key(&body, "messages")
     }
 }
 
