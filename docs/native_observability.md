@@ -13,9 +13,12 @@ routing flags need to change. Router JSONL files are created under
 precedence. `OBSERVABILITY_ROLE` defaults to `router` and should be set separately
 for colocated vLLM processes.
 
-Files rotate daily in UTC and at `OBSERVABILITY_LOG_MAX_MB` (default 256 MiB), and
-expire after `OBSERVABILITY_LOG_RETENTION_DAYS` (default seven days). These limits
-apply to segments and retention, not the total directory size. The bounded
+Files rotate daily in UTC and at `OBSERVABILITY_LOG_MAX_MB` (default 256 MiB).
+Filenames contain the UTC date; a busy day can have multiple segments.
+`OBSERVABILITY_LOG_RETENTION_DAYS` defaults to `0`: no automatic deletion, so
+operators can manually remove files older than seven days according to space
+needs. Set it to `7` to enable automatic cleanup. These limits apply to segments
+and retention, not the total directory size. The bounded
 background writer reports dropped records and I/O errors. File logging defaults
 to JSON without duplicate console formatting.
 

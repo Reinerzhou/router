@@ -50,8 +50,13 @@ fn number(name: &str, default: f64) -> f64 {
         })
         .unwrap_or(default);
     assert!(
-        value.is_finite() && value > 0.,
-        "{key} must be finite and positive"
+        value.is_finite()
+            && if name == "LOG_RETENTION_DAYS" {
+                value >= 0.
+            } else {
+                value > 0.
+            },
+        "{key} must be finite and nonnegative for retention, positive otherwise"
     );
     value
 }
@@ -147,7 +152,7 @@ fn config() -> &'static Config {
                 })
                 .unwrap_or_else(|| "unknown".into()),
             interval: Duration::from_secs_f64(number("LOG_INTERVAL_S", 60.)),
-            retention: Duration::from_secs_f64(number("LOG_RETENTION_DAYS", 7.) * 86400.),
+            retention: Duration::from_secs_f64(number("LOG_RETENTION_DAYS", 0.) * 86400.),
             max_bytes: (number("LOG_MAX_MB", 256.) * 1024. * 1024.) as u64,
             e2e,
             cooldown: Duration::from_secs(300),
@@ -310,21 +315,23 @@ pub fn initialize(
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
     let retention_stop = stop.clone();
-    let retention = directory.map(|directory| {
-        thread::spawn(move || {
-            while !retention_stop.load(Ordering::Relaxed) {
-                if cleanup(&directory, config().retention).is_err() {
-                    notify("log_cleanup_failed", "warning", json!({}), "firing");
-                }
-                for _ in 0..300 {
-                    if retention_stop.load(Ordering::Relaxed) {
-                        return;
+    let retention = directory
+        .filter(|_| !c.retention.is_zero())
+        .map(|directory| {
+            thread::spawn(move || {
+                while !retention_stop.load(Ordering::Relaxed) {
+                    if cleanup(&directory, config().retention).is_err() {
+                        notify("log_cleanup_failed", "warning", json!({}), "firing");
                     }
-                    thread::sleep(Duration::from_millis(200));
+                    for _ in 0..300 {
+                        if retention_stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(200));
+                    }
                 }
-            }
-        })
-    });
+            })
+        });
     let worker = thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(3))
@@ -444,6 +451,9 @@ pub fn install_panic_hook() {
 }
 
 pub fn cleanup(directory: &Path, retention: Duration) -> io::Result<()> {
+    if retention.is_zero() {
+        return Ok(());
+    }
     for item in fs::read_dir(directory)? {
         let item = item?;
         let name = item.file_name();

@@ -40,7 +40,7 @@ def wait(predicate, timeout=10):
     raise AssertionError("native integration wait timed out")
 
 
-def run(binary, output_dir):
+def run(binary, output_dir, retention_days=None):
     run_dir = (
         output_dir.resolve()
         if output_dir
@@ -189,8 +189,10 @@ def run(binary, output_dir):
             "RUST_LOG": "warn",
             "OBSERVABILITY_LOG_MAX_MB": ".01",
             "OBSERVABILITY_LOG_INTERVAL_S": ".1",
-            "OBSERVABILITY_LOG_RETENTION_DAYS": "7",
         }
+        env.pop("OBSERVABILITY_LOG_RETENTION_DAYS", None)
+        if retention_days is not None:
+            env["OBSERVABILITY_LOG_RETENTION_DAYS"] = retention_days
         owned = (
             run_dir
             / "logs"
@@ -375,7 +377,8 @@ def run(binary, output_dir):
             count = len(posts)
             time.sleep(0.3)
             assert len(posts) == count == 10, "no synthetic inference traffic"
-            assert not expired.exists() and manual.exists()
+            assert expired.exists() == (retention_days != "7")
+            assert manual.exists()
             assert len(list(owned.glob("vllm-router.*.jsonl"))) > 1
             metrics = (
                 opener.open(f"http://127.0.0.1:{metrics_port}/metrics").read().decode()
@@ -405,6 +408,8 @@ def run(binary, output_dir):
                 "minimal_configuration": True,
                 "removed_noisy_alerts": True,
                 "rotation_and_retention": True,
+                "retention_days": retention_days or "default_manual",
+                "old_log_preserved": expired.exists(),
                 "no_synthetic_inference": True,
             }
             (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -427,5 +432,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--router-binary", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--retention-days", choices=("0", "7"))
     args = parser.parse_args()
-    run(args.router_binary, args.output_dir)
+    run(args.router_binary, args.output_dir, args.retention_days)
