@@ -801,6 +801,9 @@ pub fn build_app_with_request_tracing(
     };
 
     let base_app = base_app
+        .layer(axum::middleware::from_fn(
+            crate::observability::request_middleware,
+        ))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins));
 

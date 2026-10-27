@@ -179,7 +179,7 @@ struct CliArgs {
     #[arg(long, value_enum, default_value_t = Backend::Vllm, alias = "runtime")]
     backend: Backend,
 
-    /// Directory to store log files
+    /// Native log root (UTC daily/size rolling; OBSERVABILITY_LOG_RETENTION_DAYS defaults to 7)
     #[arg(long)]
     log_dir: Option<String>,
 
@@ -631,7 +631,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("DEBUG: Filtering CLI arguments");
     let mut filtered_args: Vec<String> = Vec::new();
     let raw_args: Vec<String> = std::env::args().collect();
-    println!("DEBUG: Raw args: {:?}", raw_args);
     let mut i = 0;
 
     while i < raw_args.len() {
@@ -654,7 +653,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse CLI arguments with clap using filtered args
     println!("DEBUG: Parsing CLI arguments with clap");
-    println!("DEBUG: Filtered args: {:?}", filtered_args);
     let cli_args = CliArgs::parse_from(filtered_args);
     println!("DEBUG: CLI args parsed successfully");
     println!(
