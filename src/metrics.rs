@@ -19,6 +19,26 @@ impl Default for PrometheusConfig {
 }
 
 pub fn init_metrics() {
+    describe_histogram!(
+        "vllm_router_response_complete_seconds",
+        "Full real response body duration, including SSE to terminal EOF"
+    );
+    describe_histogram!(
+        "vllm_router_first_output_seconds",
+        "First nonempty generated output from real serving traffic"
+    );
+    describe_histogram!(
+        "vllm_router_output_chunk_gap_seconds",
+        "Gap between generated output chunks (not token TPOT)"
+    );
+    describe_histogram!(
+        "vllm_router_backend_headers_seconds",
+        "Per-phase prefill/decode time to response headers"
+    );
+    describe_counter!(
+        "vllm_router_response_completed_total",
+        "Actual complete/error/cancelled HTTP response bodies"
+    );
     // Request metrics
     describe_counter!(
         "vllm_router_requests_total",
@@ -123,7 +143,7 @@ pub fn init_metrics() {
     );
     describe_histogram!(
         "vllm_router_pd_request_duration_seconds",
-        "PD request duration by route"
+        "PD response-header duration by route; full body uses vllm_router_response_complete_seconds"
     );
 
     // Service discovery metrics
