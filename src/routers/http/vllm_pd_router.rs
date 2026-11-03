@@ -618,7 +618,7 @@ impl VllmPDRouter {
             .await
         {
             Ok(response) => {
-                debug!("Two-stage processing completed successfully");
+                debug!("P/D response headers ready; body completion is observed separately");
                 response
             }
             Err(e) => {
@@ -1928,7 +1928,7 @@ impl RouterTrait for VllmPDRouter {
                 .await
             {
                 Ok(response) => {
-                    info!("Two-stage processing completed successfully");
+                    info!("P/D response headers ready; body completion is observed separately");
                     response
                 }
                 Err(e) => {
@@ -2099,7 +2099,7 @@ impl RouterTrait for VllmPDRouter {
                 .await
             {
                 Ok(response) => {
-                    info!("Two-stage processing completed successfully");
+                    info!("P/D response headers ready; body completion is observed separately");
                     response
                 }
                 Err(e) => {

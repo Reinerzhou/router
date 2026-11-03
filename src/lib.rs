@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 pub mod config;
 pub mod logging;
+pub mod observability;
 use std::collections::HashMap;
 
 pub mod core;
