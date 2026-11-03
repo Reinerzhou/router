@@ -1429,15 +1429,15 @@ impl VllmPDRouter {
         response: Result<reqwest::Response, reqwest::Error>,
         base: &str,
         attempt: &PdAttempt,
-    ) -> Result<(StatusCode, Option<http::HeaderValue>, Bytes), PDRouterError> {
+    ) -> Result<(StatusCode, HeaderMap, Bytes), PDRouterError> {
         let result = async {
             let response = response.map_err(|error| PDRouterError::NetworkError {
                 message: format!("Prefill request to {base} failed: {}", error_chain(&error)),
             })?;
             let status = response.status();
-            let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
+            let response_headers = header_utils::preserve_response_headers(response.headers());
             let bytes = read_prefill_body(response, base).await?;
-            Ok((status, content_type, bytes))
+            Ok((status, response_headers, bytes))
         }
         .await;
         attempt.finish_prefill();
@@ -1794,26 +1794,14 @@ impl VllmPDRouter {
         // The whole P body has been consumed (or never started): do not hold P
         // admission capacity while D generates the response.
         drop(prefill_permit);
-        let (status, content_type, prefill_bytes) = finished_prefill?;
+        let (status, response_headers, prefill_bytes) = finished_prefill?;
         if !status.is_success() {
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
             RouterMetrics::record_pd_request(path);
             RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-            if status.is_client_error() {
-                let mut response = (status, prefill_bytes).into_response();
-                if let Some(content_type) = content_type {
-                    response
-                        .headers_mut()
-                        .insert(http::header::CONTENT_TYPE, content_type);
-                }
-                return Ok(response);
-            }
-            return Err(PDRouterError::NetworkError {
-                message: format!(
-                    "Prefill server {prefill_url} returned {status}: {}",
-                    String::from_utf8_lossy(&prefill_bytes)
-                ),
-            });
+            let mut response = (status, prefill_bytes).into_response();
+            *response.headers_mut() = response_headers;
+            return Ok(response);
         }
 
         // Parse prefill response to extract kv_transfer_params
@@ -2349,27 +2337,15 @@ impl VllmPDRouter {
             Ok((status, _, bytes)) if status.is_success() => {
                 serde_json::from_slice::<Value>(&bytes).ok()
             }
-            Ok((status, content_type, bytes)) => {
+            Ok((status, response_headers, bytes)) => {
                 attempt.finish_decode();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                if status.is_client_error() {
-                    let mut response = (status, bytes).into_response();
-                    if let Some(content_type) = content_type {
-                        response
-                            .headers_mut()
-                            .insert(http::header::CONTENT_TYPE, content_type);
-                    }
-                    return Ok(response);
-                }
-                return Err(PDRouterError::NetworkError {
-                    message: format!(
-                        "Prefill request failed to {} with status {}",
-                        prefill_url, status
-                    ),
-                });
+                let mut response = (status, bytes).into_response();
+                *response.headers_mut() = response_headers;
+                return Ok(response);
             }
             Err(e) => {
                 attempt.finish_decode();
