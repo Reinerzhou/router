@@ -1235,7 +1235,22 @@ impl VllmPDRouter {
             }
         };
 
-        debug!("📥 Prefill response status: {}", prefill_response.status());
+        let prefill_status = prefill_response.status();
+        if !prefill_status.is_success() {
+            prefill_worker.decrement_load();
+            self.stop_profiling(&prefill_base_url).await;
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+            return Err(PDRouterError::NetworkError {
+                message: format!(
+                    "Prefill server error {} from {}",
+                    prefill_status, prefill_url
+                ),
+            });
+        }
+
+        debug!("📥 Prefill response status: {}", prefill_status);
         debug!(
             "📥 Prefill response headers: {:?}",
             prefill_response.headers()
