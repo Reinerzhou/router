@@ -16,11 +16,16 @@ pub struct ClientRequestOptions<'a> {
 pub struct PreparedClientRequest {
     request: reqwest::RequestBuilder,
     span: Span,
+    observation: crate::observability::ClientObservation,
 }
 
 impl PreparedClientRequest {
     pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
-        let Self { request, span } = self;
+        let Self {
+            request,
+            span,
+            observation,
+        } = self;
 
         let response = if span.is_none() {
             request.send().await
@@ -30,6 +35,7 @@ impl PreparedClientRequest {
 
         match response {
             Ok(response) => {
+                observation.finish(Some(response.status().as_u16()), false);
                 if !span.is_disabled() {
                     let status = response.status();
                     span.record("http.response.status_code", status.as_u16());
@@ -45,6 +51,7 @@ impl PreparedClientRequest {
                 Ok(response)
             }
             Err(error) => {
+                observation.finish(None, true);
                 if !span.is_disabled() {
                     let message = error.to_string();
                     span.record("error", message.as_str());
@@ -62,6 +69,13 @@ pub fn prepare_client_request(
     incoming_headers: Option<&HeaderMap>,
     options: ClientRequestOptions<'_>,
 ) -> PreparedClientRequest {
+    let (prepared, observation) = crate::observability::client_request(
+        request,
+        incoming_headers,
+        options.request_phase,
+        options.url,
+    );
+    request = prepared;
     let span = if crate::otel_trace::is_otel_enabled() {
         let span = info_span!(
             target: "otel_trace",
@@ -100,7 +114,11 @@ pub fn prepare_client_request(
         Span::none()
     };
 
-    PreparedClientRequest { request, span }
+    PreparedClientRequest {
+        request,
+        span,
+        observation,
+    }
 }
 
 pub async fn send_client_request(

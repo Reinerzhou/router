@@ -256,7 +256,7 @@ struct CliArgs {
     #[arg(long, value_enum, default_value_t = Backend::Vllm, alias = "runtime")]
     backend: Backend,
 
-    /// Directory to store log files
+    /// Native framework log directory, independent of OBSERVABILITY_LOG_DIR
     #[arg(long)]
     log_dir: Option<String>,
 
@@ -762,7 +762,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("DEBUG: Prefill URLs parsed: {:?}", prefill_urls);
     // Parse CLI arguments with clap using filtered args
     println!("DEBUG: Parsing CLI arguments with clap");
-    println!("DEBUG: Filtered args: {:?}", filtered_args);
     let cli_args = CliArgs::parse_from(filtered_args);
     println!("DEBUG: CLI args parsed successfully");
     println!(

@@ -1,0 +1,1617 @@
+//! Native request lifecycle, rolling files and asynchronous event notifications.
+//! All observations come from serving traffic; no inference probes are issued.
+use axum::{
+    body::{Body, Bytes},
+    extract::Request,
+    http::{HeaderMap, HeaderValue},
+    middleware::Next,
+    response::Response,
+};
+use base64::Engine as _;
+use chrono::Utc;
+use dashmap::DashMap;
+use futures_util::Stream;
+use serde_json::{json, Value};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, SyncSender},
+        Arc, Mutex, OnceLock,
+    },
+    task::{Context, Poll},
+    thread,
+    time::{Duration, Instant, SystemTime},
+};
+use tracing::field::{Field, Visit};
+use tracing_subscriber::{layer::Context as LayerContext, Layer};
+
+const OBS_ID: &str = "x-observability-request-id";
+macro_rules! native_info {
+    ($($fields:tt)*) => {tracing::info!(component="router",service=%config().service,role=%config().role,node=%config().node,$($fields)*)};
+}
+static REQUESTS: OnceLock<DashMap<String, std::sync::Weak<Mutex<RequestState>>>> = OnceLock::new();
+static CONFIG: OnceLock<Config> = OnceLock::new();
+static ALERTS: OnceLock<SyncSender<Value>> = OnceLock::new();
+static CONDITIONS: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+static STARTED: AtomicU64 = AtomicU64::new(0);
+static COMPLETED: AtomicU64 = AtomicU64::new(0);
+static LOG_IO_ERRORS: AtomicU64 = AtomicU64::new(0);
+static WEBHOOK_ERRORS: AtomicU64 = AtomicU64::new(0);
+static ALERT_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+fn number(name: &str, default: f64) -> f64 {
+    let key = format!("OBSERVABILITY_{name}");
+    let value = std::env::var(&key)
+        .map(|s| {
+            s.parse::<f64>()
+                .expect("invalid numeric observability setting")
+        })
+        .unwrap_or(default);
+    assert!(
+        value.is_finite()
+            && if name == "LOG_RETENTION_DAYS" {
+                value >= 0.
+            } else {
+                value > 0.
+            },
+        "{key} must be finite and nonnegative for retention, positive otherwise"
+    );
+    value
+}
+
+pub struct Config {
+    service: String,
+    role: String,
+    node: String,
+    interval: Duration,
+    retention: Duration,
+    max_bytes: u64,
+    e2e: f64,
+    cooldown: Duration,
+    scan_interval: Duration,
+    webhook: Option<String>,
+    feishu: bool,
+    signing_secret: Option<String>,
+    enabled: bool,
+}
+
+fn config() -> &'static Config {
+    CONFIG.get_or_init(|| {
+        let alert_file = std::env::var("OBSERVABILITY_ALERT_CONFIG")
+            .ok()
+            .filter(|p| !p.is_empty());
+        let alert: Value = alert_file
+            .as_ref()
+            .map(|path| {
+                serde_json::from_str(&fs::read_to_string(path).expect("cannot read alert config"))
+                    .expect("invalid alert config JSON")
+            })
+            .unwrap_or(Value::Null);
+        let webhook = if alert_file.is_some() {
+            Some(
+                alert["url"]
+                    .as_str()
+                    .expect("alert config requires url")
+                    .to_owned(),
+            )
+        } else {
+            std::env::var("OBSERVABILITY_WEBHOOK_URL_FILE")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .map(|path| {
+                    fs::read_to_string(path)
+                        .expect("cannot read private webhook file")
+                        .trim()
+                        .to_owned()
+                })
+        };
+        if let Some(url) = &webhook {
+            assert!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "alert URL must be HTTP(S)"
+            );
+        }
+        let feishu = if alert_file.is_some() {
+            alert["format"].as_str().unwrap_or("feishu") == "feishu"
+        } else {
+            webhook
+                .as_ref()
+                .is_some_and(|url| url.starts_with("https://open.feishu.cn/open-apis/bot/"))
+        };
+        let signing_secret = alert["secret"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let e2e = alert["slow_request_seconds"].as_f64().unwrap_or(30.);
+        assert!(
+            e2e.is_finite() && e2e > 0.,
+            "slow_request_seconds must be finite and positive"
+        );
+        let role = std::env::var("OBSERVABILITY_ROLE").unwrap_or_else(|_| "router".into());
+        let service =
+            std::env::var("OBSERVABILITY_SERVICE").unwrap_or_else(|_| "online-inference".into());
+        for s in [&role, &service] {
+            assert!(
+                !s.is_empty()
+                    && s != "."
+                    && s != ".."
+                    && s.bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c)),
+                "invalid service/role identifier"
+            );
+        }
+        Config {
+            role,
+            service,
+            node: std::env::var("HOSTNAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    fs::read_to_string("/proc/sys/kernel/hostname")
+                        .ok()
+                        .map(|s| s.trim().to_owned())
+                })
+                .unwrap_or_else(|| "unknown".into()),
+            interval: Duration::from_secs_f64(number("LOG_INTERVAL_S", 60.)),
+            retention: Duration::from_secs_f64(number("LOG_RETENTION_DAYS", 0.) * 86400.),
+            max_bytes: (number("LOG_MAX_MB", 256.) * 1024. * 1024.) as u64,
+            e2e,
+            cooldown: Duration::from_secs_f64(number("ALERT_COOLDOWN_S", 300.)),
+            scan_interval: Duration::from_secs_f64(number("INFLIGHT_SCAN_S", 0.2)),
+            webhook,
+            feishu,
+            signing_secret,
+            enabled: match std::env::var("OBSERVABILITY_ENABLED").as_deref() {
+                Ok("0") => false,
+                Ok("1") => true,
+                Ok(_) => panic!("OBSERVABILITY_ENABLED must be 0 or 1"),
+                Err(_) => false,
+            },
+        }
+    })
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| {
+        mutex.clear_poison();
+        metrics::counter!("vllm_router_observability_mutex_poison_total").increment(1);
+        error.into_inner()
+    })
+}
+
+fn requests() -> &'static DashMap<String, std::sync::Weak<Mutex<RequestState>>> {
+    REQUESTS.get_or_init(DashMap::new)
+}
+
+pub fn notify(kind: &str, severity: &str, fields: Value, status: &str) {
+    let c = config();
+    let Some(sender) = ALERTS.get() else { return };
+    if !c.enabled || c.webhook.is_none() || !essential_alert(kind) {
+        return;
+    }
+    let labels = json!({"alertname":kind,"severity":severity,"service":c.service,
+        "component":"router","role":c.role,"node":c.node});
+    let mut annotations: serde_json::Map<String, Value> = fields
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| {
+            let mut text = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            for key in ["OPENAI_API_KEY", "VLLM_API_KEY", "HF_TOKEN"] {
+                if let Ok(secret) = std::env::var(key) {
+                    if !secret.is_empty() {
+                        text = text.replace(&secret, "<redacted>");
+                    }
+                }
+            }
+            (key, json!(text))
+        })
+        .collect();
+    annotations.insert(
+        "summary".into(),
+        json!(format!("Router {kind} on {}", c.role)),
+    );
+    let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hasher::write(&mut fingerprint, labels.to_string().as_bytes());
+    let fingerprint = format!("{:016x}", std::hash::Hasher::finish(&fingerprint));
+    let payload = json!({"version":"4","receiver":"native-observability","status":status,
+        "groupKey":fingerprint,"commonLabels":labels,"commonAnnotations":annotations,
+        "alerts":[{"status":status,"labels":labels,"annotations":annotations,"startsAt":stamp,
+            "fingerprint":fingerprint,"endsAt":if status=="resolved" {stamp.as_str()} else {"0001-01-01T00:00:00Z"}}]});
+    if sender.try_send(payload).is_err() {
+        ALERT_DROPPED.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("vllm_router_observability_alert_dropped_total").increment(1);
+    }
+}
+
+fn essential_alert(kind: &str) -> bool {
+    matches!(
+        kind,
+        "cuda_oom"
+            | "gpu_fault"
+            | "runtime_fatal"
+            | "request_failed"
+            | "request_e2e_slow"
+            | "log_queue_full"
+            | "log_io_failed"
+    )
+}
+
+fn feishu_message(payload: &Value, secret: Option<&str>) -> Value {
+    let labels = &payload["commonLabels"];
+    let fields = &payload["commonAnnotations"];
+    let value = |key: &str| labels[key].as_str().unwrap_or("");
+    let mut text = format!(
+        "[推理告警] {} {}\n状态: {}\n服务: {}\n组件: {} / {}\n节点: {}\n时间: {}",
+        value("severity"),
+        value("alertname"),
+        payload["status"].as_str().unwrap_or(""),
+        value("service"),
+        value("component"),
+        value("role"),
+        value("node"),
+        payload["alerts"][0]["startsAt"].as_str().unwrap_or("")
+    );
+    for key in [
+        "request_id",
+        "route",
+        "elapsed_seconds",
+        "threshold_seconds",
+        "error",
+        "message",
+    ] {
+        if let Some(value) = fields.get(key) {
+            let value = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            text.push_str(&format!(
+                "\n{key}: {}",
+                value.chars().take(1000).collect::<String>()
+            ));
+        }
+    }
+    let mut body = json!({"msg_type":"text","content":{"text":text}});
+    if let Some(secret) = secret {
+        let timestamp = Utc::now().timestamp().to_string();
+        let key = ring::hmac::Key::new(
+            ring::hmac::HMAC_SHA256,
+            format!("{timestamp}\n{secret}").as_bytes(),
+        );
+        body["sign"] =
+            json!(base64::engine::general_purpose::STANDARD
+                .encode(ring::hmac::sign(&key, b"").as_ref()));
+        body["timestamp"] = json!(timestamp);
+    }
+    body
+}
+
+pub struct NativeGuard {
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+    _retention: Option<thread::JoinHandle<()>>,
+}
+impl Drop for NativeGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+pub fn initialize(
+    directory: Option<PathBuf>,
+    dropped: Option<tracing_appender::non_blocking::ErrorCounter>,
+) -> NativeGuard {
+    let c = config();
+    if !c.enabled {
+        return NativeGuard {
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            _retention: None,
+        };
+    }
+    let (sender, receiver) = mpsc::sync_channel::<Value>(256);
+    let _ = ALERTS.set(sender);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let retention_stop = stop.clone();
+    let retention = directory
+        .filter(|_| !c.retention.is_zero())
+        .map(|directory| {
+            thread::spawn(move || {
+                while !retention_stop.load(Ordering::Relaxed) {
+                    if let Err(error) =
+                        cleanup_layout(&directory, config().retention, config().role == "router")
+                    {
+                        log_io_error(&error);
+                    }
+                    for _ in 0..300 {
+                        if retention_stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            })
+        });
+    let worker = thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("webhook HTTP client");
+        let mut last_snapshot = Instant::now();
+        let mut last_inflight_scan = Instant::now();
+        let mut dedup = HashMap::<String, Instant>::new();
+        let mut statuses = HashMap::<String, String>::new();
+        let mut starts = HashMap::<String, String>::new();
+        let mut previous_dropped = 0;
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(mut payload) => {
+                    let key = format!("{}:{}", payload["groupKey"], payload["status"]);
+                    let group = payload["groupKey"].as_str().unwrap_or("").to_owned();
+                    let status = payload["status"].as_str().unwrap_or("").to_owned();
+                    let now = payload["alerts"][0]["startsAt"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned();
+                    let started = if status == "firing" {
+                        starts.entry(group.clone()).or_insert(now).clone()
+                    } else {
+                        starts.remove(&group).unwrap_or(now)
+                    };
+                    payload["alerts"][0]["startsAt"] = json!(started);
+                    if status == "resolved"
+                        && statuses.get(&group).map(String::as_str) != Some("firing")
+                    {
+                        continue;
+                    }
+                    if dedup
+                        .get(&key)
+                        .is_none_or(|time| time.elapsed() >= c.cooldown)
+                    {
+                        if let Some(url) = &c.webhook {
+                            for attempt in 0..3 {
+                                let body = if c.feishu {
+                                    feishu_message(&payload, c.signing_secret.as_deref())
+                                } else {
+                                    payload.clone()
+                                };
+                                let delivered =
+                                    client.post(url).json(&body).send().is_ok_and(|response| {
+                                        response.status().is_success()
+                                            && (!c.feishu
+                                                || response.json::<Value>().ok().is_some_and(|v| {
+                                                    v.get("code")
+                                                        .or_else(|| v.get("StatusCode"))
+                                                        .and_then(Value::as_i64)
+                                                        == Some(0)
+                                                }))
+                                    });
+                                if delivered {
+                                    metrics::counter!(
+                                        "vllm_router_observability_webhook_delivered_total"
+                                    )
+                                    .increment(1);
+                                    dedup.insert(key.clone(), Instant::now());
+                                    statuses.insert(group.clone(), status.clone());
+                                    break;
+                                } else {
+                                    WEBHOOK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                                    metrics::counter!(
+                                        "vllm_router_observability_webhook_errors_total"
+                                    )
+                                    .increment(1);
+                                    if attempt < 2 {
+                                        thread::sleep(Duration::from_millis(200));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let stopping_now = stopping.load(Ordering::Relaxed);
+            if !stopping_now && last_inflight_scan.elapsed() >= c.scan_interval {
+                check_inflight();
+                last_inflight_scan = Instant::now();
+            }
+            if stopping_now || last_snapshot.elapsed() >= c.interval {
+                last_snapshot = Instant::now();
+                let lost = dropped
+                    .as_ref()
+                    .map(|counter| counter.dropped_lines())
+                    .unwrap_or(0);
+                if lost > previous_dropped {
+                    metrics::counter!("vllm_router_observability_log_dropped_total")
+                        .increment((lost - previous_dropped) as u64);
+                    notify(
+                        "log_queue_full",
+                        "critical",
+                        json!({"dropped":lost}),
+                        "firing",
+                    );
+                    previous_dropped = lost;
+                }
+                tracing::info!(event="observability_status",component="router",service=%c.service,role=%c.role,node=%c.node,
+                    inflight=requests().len(),started=STARTED.load(Ordering::Relaxed),completed=COMPLETED.load(Ordering::Relaxed),log_dropped=lost,
+                    log_io_errors=LOG_IO_ERRORS.load(Ordering::Relaxed),webhook_errors=WEBHOOK_ERRORS.load(Ordering::Relaxed),alert_dropped=ALERT_DROPPED.load(Ordering::Relaxed));
+            }
+            if stopping_now {
+                break;
+            }
+        }
+    });
+    NativeGuard {
+        stop,
+        worker: Some(worker),
+        _retention: retention,
+    }
+}
+
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(event="runtime_panic",panic=%info);
+        previous(info);
+    }));
+}
+
+fn is_log_file(name: &str) -> bool {
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| regex::Regex::new(
+        r"^(?:[0-9]{8}T[0-9]{6}\.[0-9]{6}Z\.[1-9][0-9]*(?:\.[1-9][0-9]*)?|vllm-router\.[0-9]{8}T[0-9]{6}\.[0-9]{6}Z\.[1-9][0-9]*\.[0-9a-f]{32})\.jsonl$"
+    ).unwrap()).is_match(name)
+}
+
+pub fn cleanup(directory: &Path, retention: Duration) -> io::Result<()> {
+    if retention.is_zero() {
+        return Ok(());
+    }
+    for item in fs::read_dir(directory)? {
+        let item = item?;
+        if is_log_file(&item.file_name().to_string_lossy()) && item.file_type()?.is_file() {
+            match item.metadata().and_then(|meta| meta.modified()) {
+                Ok(modified)
+                    if SystemTime::now()
+                        .duration_since(modified)
+                        .unwrap_or_default()
+                        > retention =>
+                {
+                    match fs::remove_file(item.path()) {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                        _ => {}
+                    }
+                }
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_layout(directory: &Path, retention: Duration, legacy_default: bool) -> io::Result<()> {
+    cleanup(directory, retention)?;
+    if legacy_default && !retention.is_zero() {
+        let legacy = directory.join("router");
+        match fs::symlink_metadata(&legacy) {
+            Ok(meta) if meta.is_dir() => cleanup(&legacy, retention)?,
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn role_directory(root: &Path, node: &str, role: &str) -> PathBuf {
+    let directory = root.join(node);
+    if role == "router" {
+        directory
+    } else {
+        directory.join(role)
+    }
+}
+
+fn open_log_file(directory: &Path, stamp: &str, pid: u32) -> io::Result<File> {
+    for sequence in 0..10000 {
+        let suffix = if sequence == 0 {
+            String::new()
+        } else {
+            format!(".{sequence}")
+        };
+        let path = directory.join(format!("{stamp}.{pid}{suffix}.jsonl"));
+        match OpenOptions::new().create_new(true).write(true).open(path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            result => return result,
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "exhausted 10000 lifecycle log filenames",
+    ))
+}
+
+pub struct RollingWriter {
+    directory: PathBuf,
+    file: File,
+    day: chrono::NaiveDate,
+    size: u64,
+    secrets: Vec<String>,
+}
+impl RollingWriter {
+    pub fn new(root: &Path) -> io::Result<Self> {
+        let c = config();
+        let directory = role_directory(root, &c.node, &c.role);
+        fs::create_dir_all(&directory)?;
+        cleanup_layout(&directory, c.retention, c.role == "router")?;
+        let file = Self::open(&directory)?;
+        Ok(Self {
+            directory,
+            file,
+            day: Utc::now().date_naive(),
+            size: 0,
+            secrets: ["OPENAI_API_KEY", "VLLM_API_KEY", "HF_TOKEN"]
+                .iter()
+                .filter_map(|k| std::env::var(k).ok())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        })
+    }
+    fn open(directory: &Path) -> io::Result<File> {
+        open_log_file(
+            directory,
+            &Utc::now().format("%Y%m%dT%H%M%S%.6fZ").to_string(),
+            std::process::id(),
+        )
+    }
+    pub fn directory(&self) -> PathBuf {
+        self.directory.clone()
+    }
+}
+fn log_io_error(error: &io::Error) {
+    LOG_IO_ERRORS.fetch_add(1, Ordering::Relaxed);
+    metrics::counter!("vllm_router_observability_log_io_errors_total").increment(1);
+    notify(
+        "log_io_failed",
+        "critical",
+        json!({"error_kind":format!("{:?}",error.kind())}),
+        "firing",
+    );
+}
+
+impl Write for RollingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut text = std::borrow::Cow::Borrowed(bytes);
+        for secret in &self.secrets {
+            text = std::borrow::Cow::Owned(
+                String::from_utf8_lossy(&text)
+                    .replace(secret, "<redacted>")
+                    .into_bytes(),
+            );
+        }
+        let result = (|| {
+            if self.day != Utc::now().date_naive()
+                || (self.size > 0 && self.size + text.len() as u64 > config().max_bytes)
+            {
+                self.file.flush()?;
+                self.file = Self::open(&self.directory)?;
+                self.day = Utc::now().date_naive();
+                self.size = 0;
+            }
+            self.file.write_all(&text)?;
+            self.size += text.len() as u64;
+            Ok(bytes.len())
+        })();
+        result.inspect_err(log_io_error)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush().inspect_err(log_io_error)
+    }
+}
+
+#[derive(Default)]
+struct Fields(serde_json::Map<String, Value>);
+impl Visit for Fields {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().into(), json!(format!("{value:?}")));
+    }
+}
+pub struct FailureLayer;
+impl<S: tracing::Subscriber> Layer<S> for FailureLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _: LayerContext<'_, S>) {
+        if !config().enabled || *event.metadata().level() != tracing::Level::ERROR {
+            return;
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        let text = serde_json::to_string(&fields.0)
+            .unwrap_or_default()
+            .to_lowercase();
+        let kind = if text.contains("out of memory") {
+            "cuda_oom"
+        } else if text.contains("illegal memory access") {
+            "gpu_fault"
+        } else if text.contains("panic") {
+            "runtime_fatal"
+        } else {
+            return;
+        };
+        notify(
+            kind,
+            "critical",
+            json!({"target":event.metadata().target(),"message":text.chars().take(2000).collect::<String>()}),
+            "firing",
+        );
+    }
+}
+
+#[derive(Default)]
+struct ReasoningSummary {
+    first: Option<f64>,
+    last: Option<f64>,
+    content: Option<f64>,
+    tokens: Option<u64>,
+}
+impl ReasoningSummary {
+    fn observe_text(&mut self, elapsed: f64, reasoning: &Value, content: &Value) -> bool {
+        let nonempty = |v: &Value| v.as_str().is_some_and(|s| !s.is_empty());
+        let mut visible = false;
+        if nonempty(reasoning) {
+            self.first.get_or_insert(elapsed);
+            self.last = Some(elapsed);
+            visible = true;
+        }
+        if nonempty(content) {
+            self.content.get_or_insert(elapsed);
+            visible = true;
+        }
+        visible
+    }
+    fn observe(&mut self, event: &Value, elapsed: f64, streaming: bool) -> bool {
+        let kind = event["type"].as_str().unwrap_or("");
+        let mut visible = false;
+        if streaming {
+            if let Some(choices) = event["choices"].as_array() {
+                for c in choices {
+                    let reasoning = if c["delta"]["reasoning"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                    {
+                        &c["delta"]["reasoning"]
+                    } else {
+                        &c["delta"]["reasoning_content"]
+                    };
+                    let content = if c["delta"]["content"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                    {
+                        &c["delta"]["content"]
+                    } else {
+                        &c["text"]
+                    };
+                    visible |= self.observe_text(elapsed, reasoning, content);
+                    visible |= c["delta"]["tool_calls"]
+                        .as_array()
+                        .is_some_and(|a| !a.is_empty());
+                }
+            }
+            let delta = &event["delta"];
+            if let Some(text) = delta.as_str() {
+                match kind {
+                    "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                        visible |= self.observe_text(elapsed, delta, &Value::Null);
+                    }
+                    "response.output_text.delta" => {
+                        visible |= self.observe_text(elapsed, &Value::Null, delta);
+                    }
+                    _ => {}
+                }
+                visible |= !text.is_empty();
+            } else if delta.is_object() {
+                if kind == "content_block_delta" {
+                    match delta["type"].as_str().unwrap_or("") {
+                        "thinking_delta" => {
+                            visible |= self.observe_text(elapsed, &delta["thinking"], &Value::Null);
+                        }
+                        "text_delta" => {
+                            visible |= self.observe_text(elapsed, &Value::Null, &delta["text"]);
+                        }
+                        _ => {}
+                    }
+                }
+                visible |= ["text", "thinking", "partial_json"]
+                    .iter()
+                    .any(|key| delta[key].as_str().is_some_and(|s| !s.is_empty()));
+            }
+            if kind == "content_block_start" {
+                let block = &event["content_block"];
+                match block["type"].as_str().unwrap_or("") {
+                    "thinking" => {
+                        visible |= self.observe_text(elapsed, &block["thinking"], &Value::Null);
+                    }
+                    "text" => {
+                        visible |= self.observe_text(elapsed, &Value::Null, &block["text"]);
+                    }
+                    "tool_use" => {
+                        visible = true;
+                    }
+                    _ => {}
+                }
+            } else if kind == "response.output_item.added" {
+                visible |= event["item"]["type"] == "function_call";
+            }
+        }
+        let (usage, details_name) = if matches!(kind, "response.completed" | "response.incomplete")
+        {
+            (&event["response"]["usage"], "output_tokens_details")
+        } else if !streaming || event["choices"].as_array().is_some_and(Vec::is_empty) {
+            (
+                &event["usage"],
+                if event["object"] == "response" {
+                    "output_tokens_details"
+                } else {
+                    "completion_tokens_details"
+                },
+            )
+        } else {
+            (&Value::Null, "completion_tokens_details")
+        };
+        if !usage.is_null() {
+            self.tokens = usage[details_name]["reasoning_tokens"].as_u64();
+        }
+        visible
+    }
+    fn to_content(&self) -> Option<f64> {
+        self.first
+            .zip(self.content)
+            .and_then(|(first, content)| (content >= first).then_some(content - first))
+    }
+}
+
+#[cfg(test)]
+mod endpoint_contract_tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_summaries_match_shared_contract() {
+        let cases: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/native_observability_cases.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let mut summary = ReasoningSummary::default();
+            let mut first_output = None;
+            for item in case["events"].as_array().unwrap() {
+                let elapsed = item["at"].as_f64().unwrap();
+                if summary.observe(&item["data"], elapsed, case["streaming"].as_bool().unwrap()) {
+                    first_output.get_or_insert(elapsed);
+                }
+            }
+            let expected = &case["expected"];
+            for (key, actual) in [
+                ("reasoning_first_seconds", summary.first),
+                ("reasoning_last_seconds", summary.last),
+                ("content_first_seconds", summary.content),
+                ("reasoning_to_content_seconds", summary.to_content()),
+                ("first_output_seconds", first_output),
+            ] {
+                assert_eq!(actual, expected[key].as_f64(), "{name}/{key}");
+            }
+            let tokens = case["success"]
+                .as_bool()
+                .unwrap()
+                .then_some(summary.tokens)
+                .flatten();
+            assert_eq!(tokens, expected["reasoning_tokens"].as_u64(), "{name}");
+            assert_eq!(
+                tokens.is_some(),
+                expected["reasoning_tokens_complete"].as_bool().unwrap(),
+                "{name}"
+            );
+        }
+    }
+}
+
+struct RequestState {
+    id: String,
+    client_id: String,
+    route: String,
+    start: Instant,
+    status: u16,
+    streaming: bool,
+    summary: ReasoningSummary,
+    json_overflow: bool,
+    first: Option<Instant>,
+    last: Option<Instant>,
+    max_gap: f64,
+    chunks: u64,
+    pending: Vec<u8>,
+    done: bool,
+    protocol_error: bool,
+    finished: bool,
+    tripped: HashSet<String>,
+    phase: String,
+}
+impl RequestState {
+    fn fields(&self) -> Value {
+        json!({"request_id":self.id,"client_request_id":self.client_id,"route":self.route,"stage":self.phase,"status":self.status})
+    }
+    fn trip(&mut self, kind: &str, elapsed: f64, threshold: f64) {
+        if self.tripped.insert(kind.into()) {
+            tracing::warn!(component="router",service=%config().service,role=%config().role,node=%config().node,event=kind,request_id=%self.id,client_request_id=%self.client_id,route=%self.route,stage=%self.phase,elapsed_seconds=elapsed,threshold_seconds=threshold);
+            let mut conditions = lock_recover(CONDITIONS.get_or_init(Mutex::default));
+            let active = conditions.entry(kind.into()).or_default();
+            let first = active.is_empty();
+            active.insert(self.id.clone());
+            drop(conditions);
+            if first {
+                let mut fields = self.fields();
+                fields["elapsed_seconds"] = json!(elapsed);
+                fields["threshold_seconds"] = json!(threshold);
+                notify(kind, "warning", fields, "firing");
+            }
+        }
+    }
+    fn inspect_json(&mut self, bytes: &[u8]) {
+        if !self.json_overflow && self.pending.len() + bytes.len() <= MAX_OBSERVATION_BYTES {
+            self.pending.extend_from_slice(bytes);
+        } else {
+            self.pending.clear();
+            self.json_overflow = true;
+        }
+    }
+    fn observe_sse(&mut self, event: SseEvent) {
+        let event = match event {
+            SseEvent::Done => {
+                self.done = true;
+                return;
+            }
+            SseEvent::Invalid => {
+                self.protocol_error = true;
+                return;
+            }
+            SseEvent::Json(event) => event,
+        };
+        let visible = self
+            .summary
+            .observe(&event, self.start.elapsed().as_secs_f64(), true);
+        let kind = event["type"].as_str().unwrap_or("");
+        if ["response.completed", "response.incomplete", "message_stop"].contains(&kind) {
+            self.done = true;
+        }
+        if event.get("error").is_some_and(|v| !v.is_null())
+            || kind == "response.failed"
+            || kind == "error"
+        {
+            self.protocol_error = true;
+            notify("stream_error_event", "critical", self.fields(), "firing");
+        }
+        if visible {
+            let now = Instant::now();
+            if self.first.is_none() {
+                self.first = Some(now);
+                let ttft = self.start.elapsed().as_secs_f64();
+                metrics::histogram!("vllm_router_first_output_seconds","route"=>self.route.clone())
+                    .record(ttft);
+                native_info!(event="first_output",request_id=%self.id,client_request_id=%self.client_id,route=%self.route,ttft_seconds=ttft);
+            }
+            if let Some(last) = self.last {
+                let gap = now.duration_since(last).as_secs_f64();
+                self.max_gap = self.max_gap.max(gap);
+                metrics::histogram!("vllm_router_output_chunk_gap_seconds","route"=>self.route.clone()).record(gap);
+            }
+            self.last = Some(now);
+            self.chunks += 1;
+        }
+    }
+    fn finish(&mut self, forced: Option<&str>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        // Clients may close the transport immediately after an SSE terminal event.
+        let forced = if forced == Some("cancelled") && self.streaming && self.done {
+            None
+        } else {
+            forced
+        };
+        if !self.streaming && !self.json_overflow {
+            if let Ok(event) = serde_json::from_slice::<Value>(&self.pending) {
+                self.summary
+                    .observe(&event, self.start.elapsed().as_secs_f64(), false);
+            }
+            self.pending.clear();
+        }
+        let elapsed = self.start.elapsed().as_secs_f64();
+        if elapsed > config().e2e {
+            self.trip("request_e2e_slow", elapsed, config().e2e);
+        }
+        let outcome = forced.unwrap_or(
+            if self.protocol_error || self.status >= 500 || self.streaming && !self.done {
+                "error"
+            } else if self.status >= 400 {
+                "client_error"
+            } else {
+                "success"
+            },
+        );
+        if outcome == "error" {
+            notify("request_failed", "critical", self.fields(), "firing");
+        }
+        COMPLETED.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("vllm_router_response_completed_total","route"=>self.route.clone(),"outcome"=>outcome.to_owned()).increment(1);
+        metrics::histogram!("vllm_router_response_complete_seconds","route"=>self.route.clone())
+            .record(elapsed);
+        let terminal_reason = if forced == Some("cancelled") {
+            "cancelled"
+        } else if forced.is_some() {
+            "response_body_error"
+        } else if self.status >= 500 {
+            "http_5xx"
+        } else if self.status >= 400 {
+            "http_4xx"
+        } else if self.protocol_error {
+            "stream_protocol_error"
+        } else if self.streaming && !self.done {
+            "stream_truncated"
+        } else if self.streaming {
+            "stream_completed"
+        } else {
+            "response_completed"
+        };
+        let reasoning_tokens = if outcome == "success" {
+            self.summary.tokens
+        } else {
+            None
+        };
+        native_info!(
+            reasoning_first_seconds=self.summary.first,
+            reasoning_last_seconds=self.summary.last,
+            content_first_seconds=self.summary.content,
+            reasoning_to_content_seconds=self.summary.to_content(),
+            reasoning_tokens,
+            reasoning_tokens_complete=reasoning_tokens.is_some(),
+            event="request_finished",streaming=self.streaming,terminal_reason,request_id=%self.id,client_request_id=%self.client_id,route=%self.route,status=self.status,outcome,
+            e2e_seconds=elapsed,ttft_seconds=self.first.map(|t|t.duration_since(self.start).as_secs_f64()).unwrap_or(f64::NAN),output_chunks=self.chunks,max_chunk_gap_seconds=self.max_gap,protocol_done=self.done);
+        let mut resolved = Vec::new();
+        {
+            let mut conditions = lock_recover(CONDITIONS.get_or_init(Mutex::default));
+            for kind in &self.tripped {
+                if let Some(active) = conditions.get_mut(kind) {
+                    active.remove(&self.id);
+                    if active.is_empty() {
+                        resolved.push(kind.clone());
+                    }
+                }
+            }
+        }
+        for kind in resolved {
+            let mut fields = self.fields();
+            fields["outcome"] = json!(outcome);
+            notify(&kind, "warning", fields, "resolved");
+        }
+        requests().remove(&self.id);
+    }
+}
+
+fn check_inflight() {
+    // Clone weak entries before locking; finish removes the map entry under the state lock.
+    let active: Vec<_> = requests()
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect();
+    for (id, weak) in active {
+        let Some(state) = weak.upgrade() else {
+            requests().remove(&id);
+            continue;
+        };
+        let mut s = match state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                state.clear_poison();
+                error.into_inner()
+            }
+        };
+        if s.finished {
+            continue;
+        }
+        let elapsed = s.start.elapsed().as_secs_f64();
+        if elapsed > config().e2e {
+            s.trip("request_e2e_slow", elapsed, config().e2e);
+        }
+    }
+}
+
+pub async fn request_middleware(mut request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    if !config().enabled
+        || ![
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages",
+            "/generate",
+        ]
+        .contains(&path.as_str())
+    {
+        return next.run(request).await;
+    }
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let client_id = request
+        .extensions()
+        .get::<crate::middleware::RequestId>()
+        .map(|id| id.0.clone())
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-request-id")
+                .and_then(|s| s.to_str().ok())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| id.clone());
+    request
+        .headers_mut()
+        .insert(OBS_ID, HeaderValue::from_str(&id).unwrap());
+    if !request.headers().contains_key("x-request-id") {
+        if let Ok(value) = HeaderValue::from_str(&client_id) {
+            request.headers_mut().insert("x-request-id", value);
+        }
+    }
+    let state = Arc::new(Mutex::new(RequestState {
+        id: id.clone(),
+        client_id: client_id.clone(),
+        route: path.clone(),
+        start: Instant::now(),
+        status: 0,
+        streaming: false,
+        summary: ReasoningSummary::default(),
+        json_overflow: false,
+        first: None,
+        last: None,
+        max_gap: 0.,
+        chunks: 0,
+        pending: Vec::new(),
+        done: false,
+        protocol_error: false,
+        finished: false,
+        tripped: HashSet::new(),
+        phase: "router".into(),
+    }));
+    requests().insert(id.clone(), Arc::downgrade(&state));
+    STARTED.fetch_add(1, Ordering::Relaxed);
+    let mut guard = PendingRequest(Some(state.clone()));
+    native_info!(event="request_started",request_id=%id,client_request_id=%client_id,route=%path);
+    let response = next.run(request).await;
+    {
+        let mut s = lock_recover(&state);
+        s.status = response.status().as_u16();
+        s.streaming = response
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+        native_info!(event="response_headers",request_id=%id,client_request_id=%client_id,status=s.status,elapsed_seconds=s.start.elapsed().as_secs_f64());
+    }
+    let (mut parts, body) = response.into_parts();
+    parts
+        .headers
+        .insert(OBS_ID, HeaderValue::from_str(&id).unwrap());
+    guard.0.take();
+    let parser = lock_recover(&state).streaming.then(SseParser::default);
+    Response::from_parts(
+        parts,
+        Body::from_stream(ObservedStream {
+            inner: Box::pin(body.into_data_stream()),
+            parser,
+            state,
+        }),
+    )
+}
+
+const MAX_OBSERVATION_BYTES: usize = 1024 * 1024;
+
+enum SseEvent {
+    Done,
+    Json(Value),
+    Invalid,
+}
+
+#[derive(Default)]
+struct SseParser {
+    pending: Vec<u8>,
+    discard_line: bool,
+}
+impl SseParser {
+    fn inspect(&mut self, bytes: &[u8], mut consume: impl FnMut(SseEvent)) {
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if !self.discard_line {
+                if self.pending.len() + part.len() > MAX_OBSERVATION_BYTES {
+                    self.pending.clear();
+                    self.discard_line = true;
+                    consume(SseEvent::Invalid);
+                } else {
+                    self.pending.extend_from_slice(part);
+                }
+            }
+            if part.ends_with(b"\n") {
+                if !self.discard_line {
+                    if let Some(data) = self.pending.strip_prefix(b"data:") {
+                        let data = data.trim_ascii();
+                        let event = if data == b"[DONE]" {
+                            SseEvent::Done
+                        } else {
+                            serde_json::from_slice(data)
+                                .map(SseEvent::Json)
+                                .unwrap_or(SseEvent::Invalid)
+                        };
+                        consume(event);
+                    }
+                    self.pending.clear();
+                }
+                self.discard_line = false;
+            }
+        }
+    }
+}
+
+struct PendingRequest(Option<Arc<Mutex<RequestState>>>);
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.take() {
+            lock_recover(&state).finish(Some("cancelled"));
+        }
+    }
+}
+
+struct ObservedStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>,
+    state: Arc<Mutex<RequestState>>,
+    parser: Option<SseParser>,
+}
+impl Stream for ObservedStream {
+    type Item = Result<Bytes, axum::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(context) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                let this = &mut *self;
+                if let Some(parser) = &mut this.parser {
+                    parser.inspect(&bytes, |event| {
+                        lock_recover(&this.state).observe_sse(event);
+                    });
+                } else {
+                    lock_recover(&this.state).inspect_json(&bytes);
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                lock_recover(&self.state).finish(Some("error"));
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                lock_recover(&self.state).finish(None);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+impl Drop for ObservedStream {
+    fn drop(&mut self) {
+        lock_recover(&self.state).finish(Some("cancelled"));
+    }
+}
+
+pub struct ClientObservation {
+    state: Option<Arc<Mutex<RequestState>>>,
+    start: Instant,
+    phase: String,
+    url: String,
+    backend_id: String,
+}
+pub fn client_request(
+    mut builder: reqwest::RequestBuilder,
+    headers: Option<&HeaderMap>,
+    phase: Option<&str>,
+    url: &str,
+) -> (reqwest::RequestBuilder, ClientObservation) {
+    if !config().enabled {
+        return (
+            builder,
+            ClientObservation {
+                state: None,
+                start: Instant::now(),
+                phase: String::new(),
+                url: String::new(),
+                backend_id: String::new(),
+            },
+        );
+    }
+    let state = headers
+        .and_then(|h| h.get(OBS_ID))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|id| requests().get(id).and_then(|s| s.value().upgrade()));
+    let backend = builder
+        .try_clone()
+        .and_then(|r| r.build().ok())
+        .and_then(|r| {
+            r.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    let mut observation = ClientObservation {
+        state: state.clone(),
+        start: Instant::now(),
+        phase: phase.unwrap_or("backend").into(),
+        url: url.split('?').next().unwrap_or(url).into(),
+        backend_id: backend,
+    };
+    if let Some(state) = state {
+        let mut s = lock_recover(&state);
+        s.phase = observation.phase.clone();
+        if observation.backend_id.is_empty() {
+            observation.backend_id = s.client_id.clone();
+            builder = builder.header("X-Request-Id", &s.client_id);
+        }
+        builder = builder
+            .header("X-Observability-Phase", &observation.phase)
+            .header("X-Client-Request-Id", &s.client_id)
+            .header("X-Observability-Request-Id", &s.id);
+        native_info!(event="backend_request_started",request_id=%s.id,client_request_id=%s.client_id,backend_request_id=%observation.backend_id,phase=%observation.phase,backend_url=%observation.url);
+    }
+    (builder, observation)
+}
+impl ClientObservation {
+    pub fn finish(&self, status: Option<u16>, failed: bool) {
+        if let Some(state) = &self.state {
+            let s = lock_recover(&state);
+            let duration = self.start.elapsed().as_secs_f64();
+            native_info!(event="backend_response_headers",request_id=%s.id,client_request_id=%s.client_id,backend_request_id=%self.backend_id,
+                phase=%self.phase,backend_url=%self.url,status=status.unwrap_or(0),transport_error=failed,headers_seconds=duration);
+            metrics::histogram!("vllm_router_backend_headers_seconds","phase"=>self.phase.clone())
+                .record(duration);
+            if failed || status.is_some_and(|status| status >= 500) {
+                notify(
+                    "backend_request_failed",
+                    "critical",
+                    json!({"client_request_id":s.client_id,"backend_request_id":self.backend_id,"phase":self.phase,"status":status}),
+                    "firing",
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+
+    #[test]
+    fn long_reasoning_and_multi_choice_summary() {
+        for field in ["reasoning", "reasoning_content"] {
+            let mut s = ReasoningSummary::default();
+            s.observe(&json!({"choices":[{"delta":{field:""}}]}), 0.01, true);
+            assert_eq!(s.first, None);
+            s.observe(
+                &json!({"choices":[{"delta":{field:"thinking"}}]}),
+                0.05,
+                true,
+            );
+            for second in 1..40 {
+                s.observe(
+                    &json!({"choices":[{"index":0,"delta":{field:"more"}},
+                    {"index":1,"delta":{"reasoning":"another choice"}}]}),
+                    second as f64,
+                    true,
+                );
+            }
+            s.observe(
+                &json!({"choices":[{"delta":{"content":"answer"}}]}),
+                40.,
+                true,
+            );
+            assert_eq!(s.first, Some(0.05));
+            assert_eq!(s.last, Some(39.));
+            assert_eq!(s.content, Some(40.));
+            assert_eq!(s.to_content(), Some(39.95));
+        }
+    }
+
+    #[test]
+    fn content_before_reasoning_and_reasoning_only() {
+        let mut s = ReasoningSummary::default();
+        s.observe(
+            &json!({"choices":[{"delta":{"content":"answer"}}]}),
+            1.,
+            true,
+        );
+        s.observe(
+            &json!({"choices":[{"delta":{"reasoning":"late"}}]}),
+            2.,
+            true,
+        );
+        s.observe(
+            &json!({"choices":[{"delta":{"reasoning_content":"later"}}]}),
+            3.,
+            true,
+        );
+        assert_eq!(s.content, Some(1.));
+        assert_eq!(s.first, Some(2.));
+        assert_eq!(s.last, Some(3.));
+        assert_eq!(s.to_content(), None);
+        let mut s = ReasoningSummary::default();
+        s.observe(
+            &json!({"choices":[{"delta":{"reasoning":"only"}}]}),
+            1.,
+            true,
+        );
+        assert_eq!(s.content, None);
+        assert_eq!(s.to_content(), None);
+    }
+
+    #[test]
+    fn final_usage_is_not_a_sum_or_intermediate_count() {
+        let mut s = ReasoningSummary::default();
+        for count in [100, 200] {
+            s.observe(
+                &json!({"choices":[{"delta":{"reasoning":"more"}}],
+                "usage":{"completion_tokens_details":{"reasoning_tokens":count}}}),
+                1.,
+                true,
+            );
+        }
+        assert_eq!(s.tokens, None);
+        for count in [12, 12, 0] {
+            s.observe(
+                &json!({"choices":[],
+                "usage":{"completion_tokens_details":{"reasoning_tokens":count}}}),
+                2.,
+                true,
+            );
+            assert_eq!(s.tokens, Some(count));
+        }
+        for value in [json!(-1), json!(true), json!("12"), json!(1.5), Value::Null] {
+            s.observe(
+                &json!({"choices":[],
+                "usage":{"completion_tokens_details":{"reasoning_tokens":value}}}),
+                2.,
+                true,
+            );
+            assert_eq!(s.tokens, None);
+        }
+    }
+
+    #[test]
+    fn nonstream_usage_does_not_infer_times() {
+        let mut s = ReasoningSummary::default();
+        s.observe(
+            &json!({"choices":[{"message":{"reasoning":"hidden","content":"answer"}}],
+            "usage":{"completion_tokens_details":{"reasoning_tokens":8}}}),
+            40.,
+            false,
+        );
+        assert_eq!(s.tokens, Some(8));
+        assert_eq!(s.first, None);
+        assert_eq!(s.last, None);
+        assert_eq!(s.content, None);
+        assert_eq!(s.to_content(), None);
+    }
+}
+
+#[cfg(test)]
+mod file_layout_tests {
+    use super::*;
+
+    #[test]
+    fn optional_role_directory() {
+        let root = Path::new("/logs/router");
+        assert_eq!(role_directory(root, "node1", "router"), root.join("node1"));
+        assert_eq!(role_directory(root, "node1", "d0"), root.join("node1/d0"));
+    }
+
+    #[test]
+    fn collision_suffixes_preserve_existing_files_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let stamp = "20261103T010203.123456Z";
+        let stem = format!("{stamp}.42");
+        let old = root.path().join(format!("{stem}.jsonl"));
+        fs::write(&old, b"original").unwrap();
+        let protected = root.path().join("manual.keep");
+        fs::write(&protected, b"protected").unwrap();
+        std::os::unix::fs::symlink(&protected, root.path().join(format!("{stem}.1.jsonl")))
+            .unwrap();
+        fs::create_dir(root.path().join(format!("{stem}.2.jsonl"))).unwrap();
+        open_log_file(root.path(), stamp, 42)
+            .unwrap()
+            .write_all(b"new")
+            .unwrap();
+        assert_eq!(
+            fs::read(root.path().join(format!("{stem}.3.jsonl"))).unwrap(),
+            b"new"
+        );
+        assert_eq!(fs::read(old).unwrap(), b"original");
+        assert_eq!(fs::read(protected).unwrap(), b"protected");
+    }
+
+    #[test]
+    fn concurrent_creation_is_exclusive() {
+        let root = tempfile::tempdir().unwrap();
+        let mut workers = Vec::new();
+        for i in 0..16 {
+            let directory = root.path().to_owned();
+            workers.push(thread::spawn(move || {
+                open_log_file(&directory, "20261103T010203.123456Z", 42)
+                    .unwrap()
+                    .write_all(i.to_string().as_bytes())
+                    .unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let values: HashSet<String> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|p| fs::read_to_string(p.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(values, (0..16).map(|i| i.to_string()).collect());
+    }
+
+    #[test]
+    fn strict_current_and_legacy_filename_contract() {
+        for name in [
+            "20261103T010203.123456Z.42.jsonl",
+            "20261103T010203.123456Z.42.1.jsonl",
+            "vllm-router.20261103T010203.123456Z.42.12345678123456781234567812345678.jsonl",
+        ] {
+            assert!(is_log_file(name), "{name}");
+        }
+        for name in [
+            "manual.jsonl",
+            "vllm-router.old.jsonl",
+            "20261103.42.jsonl",
+            "20261103T010203.123456Z.42.0.jsonl",
+            "vllm.20261103T010203.123456Z.42.1234abcd.jsonl",
+        ] {
+            assert!(!is_log_file(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn cleanup_handles_migration_without_touching_other_roles_or_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path();
+        fs::create_dir(directory.join("router")).unwrap();
+        fs::create_dir(directory.join("p0")).unwrap();
+        let name = "20000101T000000.000000Z.42.jsonl";
+        let expired = [directory.join(name), directory.join("20000101T000000.000000Z.42.1.jsonl"),
+            directory.join("router/vllm-router.20000101T000000.000000Z.42.12345678123456781234567812345678.jsonl")];
+        let preserved = [
+            directory.join("manual.jsonl"),
+            directory.join("vllm-router.old.jsonl"),
+            directory.join("p0").join(name),
+        ];
+        for path in expired.iter().chain(preserved.iter()) {
+            fs::write(path, b"original").unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(SystemTime::now() - Duration::from_secs(8 * 86400)),
+                )
+                .unwrap();
+        }
+        let link = directory.join("20000101T000000.000000Z.42.2.jsonl");
+        std::os::unix::fs::symlink(&preserved[0], &link).unwrap();
+        let fresh = directory.join("20261103T000000.000000Z.42.jsonl");
+        fs::write(&fresh, b"fresh").unwrap();
+        cleanup_layout(directory, Duration::ZERO, true).unwrap();
+        assert!(expired.iter().all(|p| p.exists()));
+        cleanup_layout(directory, Duration::from_secs(7 * 86400), true).unwrap();
+        assert!(expired.iter().all(|p| !p.exists()));
+        assert!(preserved.iter().all(|p| p.exists()));
+        assert!(link.is_symlink());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn cleanup_does_not_follow_legacy_directory_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = root.path().join("logs");
+        let other = root.path().join("other");
+        fs::create_dir(&logs).unwrap();
+        fs::create_dir(&other).unwrap();
+        let protected = other.join("20000101T000000.000000Z.42.jsonl");
+        fs::write(&protected, b"keep").unwrap();
+        File::options()
+            .write(true)
+            .open(&protected)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(8 * 86400)),
+            )
+            .unwrap();
+        std::os::unix::fs::symlink(other, logs.join("router")).unwrap();
+        cleanup_layout(&logs, Duration::from_secs(1), true).unwrap();
+        assert!(protected.exists());
+    }
+
+    #[test]
+    fn creation_errors_do_not_turn_into_collision_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let error =
+            open_log_file(&root.path().join("missing"), "20261103T000000.000000Z", 42).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+    #[test]
+    fn sse_parser_handles_fragmented_and_coalesced_records() {
+        let mut parser = SseParser::default();
+        let mut events = Vec::new();
+        parser.inspect(b"data: {\"choices\":", |event| events.push(event));
+        assert!(events.is_empty());
+        parser.inspect(b"[]}\r\n\ndata: [DONE]\n", |event| events.push(event));
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], SseEvent::Json(value) if value["choices"] == json!([])));
+        assert!(matches!(events[1], SseEvent::Done));
+        assert!(parser.pending.is_empty());
+    }
+
+    #[test]
+    fn sse_parser_bounds_one_line_and_resumes_after_its_newline() {
+        let mut parser = SseParser::default();
+        let mut events = Vec::new();
+        parser.inspect(&vec![b'x'; MAX_OBSERVATION_BYTES + 1], |event| {
+            events.push(event)
+        });
+        assert!(matches!(events.as_slice(), [SseEvent::Invalid]));
+        assert!(parser.pending.is_empty());
+        parser.inspect(b"data: [DONE]\n", |event| events.push(event));
+        assert_eq!(events.len(), 1); // Still the oversized line until its newline.
+        parser.inspect(b"data: [DONE]\n", |event| events.push(event));
+        assert!(matches!(events[1], SseEvent::Done));
+    }
+
+    #[test]
+    fn poisoned_observation_lock_recovers_without_cascading_panics() {
+        let state = Arc::new(Mutex::new(7));
+        let poisoned = state.clone();
+        assert!(thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("simulate observer panic");
+        })
+        .join()
+        .is_err());
+        assert!(state.is_poisoned());
+        assert_eq!(*lock_recover(&state), 7);
+        assert!(!state.is_poisoned());
+        assert_eq!(*lock_recover(&state), 7);
+    }
+
+    #[test]
+    fn inflight_scan_prunes_dead_weak_entries() {
+        let id = uuid::Uuid::new_v4().to_string();
+        requests().insert(id.clone(), std::sync::Weak::new());
+        check_inflight();
+        assert!(!requests().contains_key(&id));
+    }
+}

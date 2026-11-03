@@ -1,0 +1,630 @@
+[
+  {
+    "name": "responses-thinking",
+    "route": "/v1/responses",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "response.reasoning_text.delta",
+          "delta": "r"
+        }
+      },
+      {
+        "at": 39,
+        "data": {
+          "type": "response.reasoning_text.delta",
+          "delta": "r"
+        }
+      },
+      {
+        "at": 40,
+        "data": {
+          "type": "response.output_text.delta",
+          "delta": "a"
+        }
+      },
+      {
+        "at": 41,
+        "data": {
+          "type": "response.completed",
+          "response": {
+            "object": "response",
+            "status": "completed",
+            "usage": {
+              "output_tokens_details": {
+                "reasoning_tokens": 7
+              }
+            }
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": 1,
+      "reasoning_last_seconds": 39,
+      "content_first_seconds": 40,
+      "reasoning_to_content_seconds": 39,
+      "reasoning_tokens": 7,
+      "reasoning_tokens_complete": true,
+      "first_output_seconds": 1
+    }
+  },
+  {
+    "name": "responses-summary",
+    "route": "/v1/responses",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "response.reasoning_summary_text.delta",
+          "delta": "r"
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "type": "response.output_text.delta",
+          "delta": "a"
+        }
+      },
+      {
+        "at": 3,
+        "data": {
+          "type": "response.completed",
+          "response": {
+            "object": "response",
+            "status": "completed",
+            "usage": {
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              }
+            }
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": 1,
+      "reasoning_last_seconds": 1,
+      "content_first_seconds": 2,
+      "reasoning_to_content_seconds": 1,
+      "reasoning_tokens": 0,
+      "reasoning_tokens_complete": true,
+      "first_output_seconds": 1
+    }
+  },
+  {
+    "name": "responses-intermediate-usage",
+    "route": "/v1/responses",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "response.created",
+          "response": {
+            "usage": {
+              "output_tokens_details": {
+                "reasoning_tokens": 999
+              }
+            }
+          }
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "type": "response.output_text.delta",
+          "delta": "a"
+        }
+      },
+      {
+        "at": 3,
+        "data": {
+          "type": "response.completed",
+          "response": {
+            "object": "response",
+            "status": "completed"
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": null,
+      "reasoning_last_seconds": null,
+      "content_first_seconds": 2,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": null,
+      "reasoning_tokens_complete": false,
+      "first_output_seconds": 2
+    }
+  },
+  {
+    "name": "responses-content-first",
+    "route": "/v1/responses",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "response.output_text.delta",
+          "delta": "a"
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "type": "response.reasoning_text.delta",
+          "delta": "r"
+        }
+      },
+      {
+        "at": 3,
+        "data": {
+          "type": "response.completed",
+          "response": {
+            "object": "response",
+            "status": "completed",
+            "usage": {
+              "output_tokens_details": {
+                "reasoning_tokens": 4
+              }
+            }
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": 2,
+      "reasoning_last_seconds": 2,
+      "content_first_seconds": 1,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": 4,
+      "reasoning_tokens_complete": true,
+      "first_output_seconds": 1
+    }
+  },
+  {
+    "name": "responses-tool",
+    "route": "/v1/responses",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "response.output_item.added",
+          "item": {
+            "type": "function_call",
+            "name": "f",
+            "arguments": ""
+          }
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "type": "response.function_call_arguments.delta",
+          "delta": "{}"
+        }
+      },
+      {
+        "at": 3,
+        "data": {
+          "type": "response.completed",
+          "response": {
+            "object": "response",
+            "status": "completed",
+            "usage": {
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              }
+            }
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": null,
+      "reasoning_last_seconds": null,
+      "content_first_seconds": null,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": 0,
+      "reasoning_tokens_complete": true,
+      "first_output_seconds": 1
+    }
+  },
+  {
+    "name": "responses-failure",
+    "route": "/v1/responses",
+    "streaming": true,
+    "success": false,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "response.reasoning_text.delta",
+          "delta": "r"
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "type": "response.failed",
+          "response": {
+            "usage": {
+              "output_tokens_details": {
+                "reasoning_tokens": 77
+              }
+            }
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": 1,
+      "reasoning_last_seconds": 1,
+      "content_first_seconds": null,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": null,
+      "reasoning_tokens_complete": false,
+      "first_output_seconds": 1
+    }
+  },
+  {
+    "name": "responses-nonstream",
+    "route": "/v1/responses",
+    "streaming": false,
+    "success": true,
+    "events": [
+      {
+        "at": 40,
+        "data": {
+          "object": "response",
+          "output": [
+            {
+              "type": "reasoning",
+              "content": [
+                {
+                  "type": "reasoning_text",
+                  "text": "r"
+                }
+              ]
+            }
+          ],
+          "usage": {
+            "output_tokens_details": {
+              "reasoning_tokens": 8
+            }
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": null,
+      "reasoning_last_seconds": null,
+      "content_first_seconds": null,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": 8,
+      "reasoning_tokens_complete": true,
+      "first_output_seconds": null
+    }
+  },
+  {
+    "name": "messages-thinking",
+    "route": "/v1/messages",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "content_block_start",
+          "content_block": {
+            "type": "thinking",
+            "thinking": "r"
+          }
+        }
+      },
+      {
+        "at": 39,
+        "data": {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "r"
+          }
+        }
+      },
+      {
+        "at": 40,
+        "data": {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "text_delta",
+            "text": "a"
+          }
+        }
+      },
+      {
+        "at": 41,
+        "data": {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "end_turn"
+          },
+          "usage": {
+            "output_tokens": 999
+          }
+        }
+      },
+      {
+        "at": 42,
+        "data": {
+          "type": "message_stop"
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": 1,
+      "reasoning_last_seconds": 39,
+      "content_first_seconds": 40,
+      "reasoning_to_content_seconds": 39,
+      "reasoning_tokens": null,
+      "reasoning_tokens_complete": false,
+      "first_output_seconds": 1
+    }
+  },
+  {
+    "name": "messages-text-start",
+    "route": "/v1/messages",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "content_block_start",
+          "content_block": {
+            "type": "text",
+            "text": "a"
+          }
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "type": "message_stop"
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": null,
+      "reasoning_last_seconds": null,
+      "content_first_seconds": 1,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": null,
+      "reasoning_tokens_complete": false,
+      "first_output_seconds": 1
+    }
+  },
+  {
+    "name": "messages-tool",
+    "route": "/v1/messages",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "content_block_start",
+          "content_block": {
+            "type": "tool_use",
+            "id": "t",
+            "name": "f",
+            "input": {}
+          }
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{}"
+          }
+        }
+      },
+      {
+        "at": 3,
+        "data": {
+          "type": "message_stop"
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": null,
+      "reasoning_last_seconds": null,
+      "content_first_seconds": null,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": null,
+      "reasoning_tokens_complete": false,
+      "first_output_seconds": 1
+    }
+  },
+  {
+    "name": "messages-hidden",
+    "route": "/v1/messages",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "content_block_start",
+          "content_block": {
+            "type": "redacted_thinking",
+            "data": "redacted"
+          }
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "text_delta",
+            "text": "a"
+          }
+        }
+      },
+      {
+        "at": 3,
+        "data": {
+          "type": "message_stop"
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": null,
+      "reasoning_last_seconds": null,
+      "content_first_seconds": 2,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": null,
+      "reasoning_tokens_complete": false,
+      "first_output_seconds": 2
+    }
+  },
+  {
+    "name": "messages-failure",
+    "route": "/v1/messages",
+    "streaming": true,
+    "success": false,
+    "events": [
+      {
+        "at": 1,
+        "data": {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "r"
+          }
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "type": "error",
+          "error": {
+            "type": "api_error",
+            "message": "fixture"
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": 1,
+      "reasoning_last_seconds": 1,
+      "content_first_seconds": null,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": null,
+      "reasoning_tokens_complete": false,
+      "first_output_seconds": 1
+    }
+  },
+  {
+    "name": "messages-nonstream",
+    "route": "/v1/messages",
+    "streaming": false,
+    "success": true,
+    "events": [
+      {
+        "at": 40,
+        "data": {
+          "type": "message",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "r"
+            },
+            {
+              "type": "text",
+              "text": "a"
+            }
+          ],
+          "usage": {
+            "input_tokens": 4,
+            "output_tokens": 999
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": null,
+      "reasoning_last_seconds": null,
+      "content_first_seconds": null,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": null,
+      "reasoning_tokens_complete": false,
+      "first_output_seconds": null
+    }
+  },
+  {
+    "name": "chat-null",
+    "route": "/v1/chat/completions",
+    "streaming": true,
+    "success": true,
+    "events": [
+      {
+        "at": 0,
+        "data": {
+          "choices": [
+            {
+              "delta": null
+            }
+          ]
+        }
+      },
+      {
+        "at": 1,
+        "data": {
+          "choices": [
+            {
+              "delta": {
+                "content": "a"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "at": 2,
+        "data": {
+          "choices": [],
+          "usage": {
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          }
+        }
+      }
+    ],
+    "expected": {
+      "reasoning_first_seconds": null,
+      "reasoning_last_seconds": null,
+      "content_first_seconds": 1,
+      "reasoning_to_content_seconds": null,
+      "reasoning_tokens": 0,
+      "reasoning_tokens_complete": true,
+      "first_output_seconds": 1
+    }
+  }
+]
