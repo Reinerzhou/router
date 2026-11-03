@@ -1029,7 +1029,6 @@ impl VllmPDRouter {
                     RouterMetrics::record_pd_prefill_error(prefill_http);
                     RouterMetrics::record_pd_request(path);
                     RouterMetrics::record_pd_request_duration(path, duration);
-                    RouterMetrics::record_pd_prefill_request(prefill_http);
                     return Err(format!(
                         "Prefill request failed to {}: {}",
                         prefill_http, prefill_err
@@ -1224,6 +1223,7 @@ impl VllmPDRouter {
             Ok(resp) => resp,
             Err(e) => {
                 prefill_worker.decrement_load();
+                self.stop_profiling(&prefill_base_url).await;
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1235,7 +1235,28 @@ impl VllmPDRouter {
             }
         };
 
-        debug!("📥 Prefill response status: {}", prefill_response.status());
+        let prefill_status = prefill_response.status();
+        if !prefill_status.is_success() {
+            prefill_worker.decrement_load();
+            self.stop_profiling(&prefill_base_url).await;
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+            // Preserve the backend's error contract without buffering or logging its body.
+            let mut response = Response::builder().status(prefill_status);
+            let mut headers = header_utils::preserve_response_headers(prefill_response.headers());
+            headers.remove(axum::http::header::CONTENT_LENGTH);
+            for (name, value) in &headers {
+                response = response.header(name, value);
+            }
+            return response
+                .body(Body::from_stream(prefill_response.bytes_stream()))
+                .map_err(|error| PDRouterError::NetworkError {
+                    message: format!("Failed to forward prefill error response: {error}"),
+                });
+        }
+
+        debug!("📥 Prefill response status: {}", prefill_status);
         debug!(
             "📥 Prefill response headers: {:?}",
             prefill_response.headers()
@@ -1246,6 +1267,7 @@ impl VllmPDRouter {
             Ok(bytes) => bytes,
             Err(e) => {
                 prefill_worker.decrement_load();
+                self.stop_profiling(&prefill_base_url).await;
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1276,6 +1298,7 @@ impl VllmPDRouter {
             Ok(json) => json,
             Err(e) => {
                 prefill_worker.decrement_load();
+                self.stop_profiling(&prefill_base_url).await;
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1405,6 +1428,7 @@ impl VllmPDRouter {
             Ok(resp) => resp,
             Err(e) => {
                 decode_worker.decrement_load();
+                self.stop_profiling(&decode_base_url).await;
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
