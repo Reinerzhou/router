@@ -143,6 +143,96 @@ impl TestContext {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod completion_json_errors {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_completion_fields_return_openai_errors() {
+        let ctx = TestContext::new(vec![]).await;
+        let app = ctx.create_app().await;
+        for stream in [false, true] {
+            for fields in [
+                json!({"prompt": "hi", "max_tokens": -1}),
+                json!({"prompt": "hi", "max_tokens": "invalid"}),
+                json!({"prompt": "hi", "n": -1}),
+                json!({"prompt": {"unexpected": "object"}}),
+                json!({}),
+            ] {
+                let mut payload = json!({"model": "test-model", "stream": stream});
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{payload}");
+                assert_eq!(resp.headers()[CONTENT_TYPE], "application/json");
+                let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+                let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(error["error"]["type"], "invalid_request_error");
+                assert!(!error["error"]["message"].as_str().unwrap().is_empty());
+            }
+        }
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_completion_bodies_return_openai_errors() {
+        let ctx = TestContext::new(vec![]).await;
+        let app = ctx.create_app().await;
+        for (body, content_type) in [
+            ("{invalid json}", Some("application/json")),
+            ("", Some("application/json")),
+            (
+                r#"{"model":"test-model","prompt":"hi"}"#,
+                Some("text/plain"),
+            ),
+            (r#"{"model":"test-model","prompt":"hi"}"#, None),
+        ] {
+            let mut req = Request::builder().method("POST").uri("/v1/completions");
+            if let Some(content_type) = content_type {
+                req = req.header(CONTENT_TYPE, content_type);
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(resp.headers()[CONTENT_TYPE], "application/json");
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert!(!error["error"]["message"].as_str().unwrap().is_empty());
+        }
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_completion_body_keeps_413() {
+        let mut ctx = TestContext::new(vec![]).await;
+        ctx.config.max_payload_size = 64;
+        let app = ctx.create_app().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"model": "test-model", "prompt": "x".repeat(100)}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod health_tests {
     use super::*;
 

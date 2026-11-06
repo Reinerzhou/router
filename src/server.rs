@@ -418,12 +418,12 @@ where
                         || value.suffix().is_some_and(|suffix| suffix == "json"))
             });
         if !json_content_type {
-            return Err(axum::extract::rejection::MissingJsonContentType::default().into_response());
+            return Err(openai_json_rejection(axum::extract::rejection::MissingJsonContentType::default().into()));
         }
         let raw = axum::body::Bytes::from_request(request, state)
             .await
             .map_err(IntoResponse::into_response)?;
-        let Json(value) = Json::<T>::from_bytes(&raw).map_err(IntoResponse::into_response)?;
+        let Json(value) = Json::<T>::from_bytes(&raw).map_err(openai_json_rejection)?;
         Ok(Self { value, raw })
     }
 }
