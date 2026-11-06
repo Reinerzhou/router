@@ -2029,8 +2029,8 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
-        if !is_stream {
-            // For non-streaming requests, preserve headers
+        if !is_stream || !status.is_success() {
+            // Keep upstream errors in their original format.
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
             if stages_on {
@@ -3477,6 +3477,121 @@ impl RouterTrait for Router {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+    #[tokio::test]
+    async fn test_streaming_generation_preserves_upstream_errors() {
+        use crate::config::RouterConfig;
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+        use axum::routing::post;
+        use serde_json::{json, Value};
+        use tokio::net::TcpListener;
+        use tower::ServiceExt;
+
+        const ERROR: &str =
+            r#"{"error":{"message":"invalid repetition_penalty","type":"invalid_request_error"}}"#;
+        const SSE: &str = "data: {\"choices\":[]}\n\ndata: [DONE]\n\n";
+        async fn upstream(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+            let status = StatusCode::from_bytes(headers["x-test-status"].as_bytes()).unwrap();
+            let (content_type, payload) = match status {
+                StatusCode::OK if body["stream"] == true => ("text/event-stream", SSE),
+                StatusCode::OK => ("application/json", r#"{"choices":[]}"#),
+                StatusCode::INTERNAL_SERVER_ERROR => ("text/plain; charset=utf-8", "backend error"),
+                _ => ("application/json", ERROR),
+            };
+            Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, content_type)
+                .header("x-backend-id", "test-worker")
+                .body(Body::from(payload))
+                .unwrap()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let backend = axum::Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .route("/v1/completions", post(upstream));
+        let backend_task = tokio::spawn(async move {
+            axum::serve(listener, backend).await.unwrap();
+        });
+
+        let mut router = create_test_sticky_router(&[&worker_url]);
+        router.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        router.retry_config.max_retries = 0;
+        let worker = router.worker_registry.get_by_url(&worker_url).unwrap();
+        let context = AppContext::new(
+            RouterConfig::default(),
+            router.client.clone(),
+            4,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            router: Arc::new(router),
+            context: Arc::new(context),
+            concurrency_queue_tx: None,
+            router_manager: None,
+        });
+        let app = build_app_with_request_tracing(state, 1024 * 1024, vec![], vec![], true, false);
+
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            for stream in [false, true] {
+                for status in [
+                    StatusCode::OK,
+                    StatusCode::BAD_REQUEST,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ] {
+                    let mut payload = json!({"model": "test-model", "stream": stream});
+                    if path == "/v1/chat/completions" {
+                        payload["messages"] = json!([{"role": "user", "content": "hi"}]);
+                    } else {
+                        payload["prompt"] = json!("hi");
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri(path)
+                                .header(CONTENT_TYPE, "application/json")
+                                .header("x-test-status", status.as_str())
+                                .body(Body::from(payload.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let (content_type, body) = match status {
+                        StatusCode::OK if stream => ("text/event-stream", SSE),
+                        StatusCode::OK => ("application/json", r#"{"choices":[]}"#),
+                        StatusCode::INTERNAL_SERVER_ERROR => {
+                            ("text/plain; charset=utf-8", "backend error")
+                        }
+                        _ => ("application/json", ERROR),
+                    };
+                    assert_eq!(response.status(), status, "{path}, stream={stream}");
+                    assert_eq!(
+                        response.headers()[CONTENT_TYPE],
+                        content_type,
+                        "{path}, stream={stream}, status={status}"
+                    );
+                    assert_eq!(response.headers()["x-backend-id"], "test-worker");
+                    if !status.is_success() {
+                        assert_eq!(worker.load(), 0);
+                    }
+                    let forwarded = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    assert_eq!(forwarded.as_ref(), body.as_bytes());
+                    assert_eq!(worker.load(), 0);
+                }
+            }
+        }
+        backend_task.abort();
+    }
+
     use super::*;
     use std::collections::HashMap;
 
