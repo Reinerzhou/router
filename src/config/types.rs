@@ -1375,6 +1375,9 @@ impl TraceConfig {
             "/health_generate".to_string(),
             "/liveness".to_string(),
             "/readiness".to_string(),
+            "/nodes/status".to_string(),
+            "/nodes/add".to_string(),
+            "/nodes/remove".to_string(),
         ]
     }
 }

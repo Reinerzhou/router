@@ -105,6 +105,9 @@ v0.1 resource / fail-closed defaults on attached routes (not configurable via CL
 
 Prometheus metrics for the WASM runtime are deferred to a later revision.
 
+See [OpenTelemetry tracing](docs/observability/opentelemetry.md) for trace propagation and
+Collector setup.
+
 #### Prefill-Decode Disaggregation
 ```bash
 # When vLLM runs the NIXL connector, prefill/decode URLs are required.

@@ -167,8 +167,12 @@ async fn health_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> 
     }
 }
 
-async fn health_generate_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
+async fn health_generate_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let config = config.read().await;
+    capture_request(config.port, "/health_generate", &headers);
 
     if should_fail(&config).await {
         return (
