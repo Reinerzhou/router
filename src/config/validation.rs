@@ -541,7 +541,7 @@ impl ConfigValidator {
                     });
                 }
             }
-            PolicyConfig::StickyLeastLoaded => {
+            PolicyConfig::StickyLeastLoaded | PolicyConfig::StickyLeastLoadedRequests => {
                 // Session expiration is sourced from the environment; no
                 // structured config to validate here.
             }
@@ -750,6 +750,48 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        if config.lmdeploy_backend
+            && matches!(
+                config.mode,
+                RoutingMode::VllmPrefillDecode { .. } | RoutingMode::OpenAI { .. }
+            )
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "lmdeploy_backend cannot be combined with a different backend routing mode"
+                    .into(),
+            });
+        }
+        let pd_policies = match &config.mode {
+            RoutingMode::VllmPrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            }
+            | RoutingMode::LMDeployPrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } => [prefill_policy.as_ref(), decode_policy.as_ref()],
+            _ => [None, None],
+        };
+        if pd_policies
+            .into_iter()
+            .flatten()
+            .any(|p| matches!(p, PolicyConfig::StickyLeastLoadedRequests))
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "request-load sticky requires regular routing".into(),
+            });
+        }
+
+        if matches!(config.policy, PolicyConfig::StickyLeastLoadedRequests)
+            && !matches!(config.mode, RoutingMode::Regular { .. })
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "request-load sticky routing currently requires regular mode".into(),
+            });
+        }
+
         if let Some(program) = &config.program_scheduling {
             let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
             if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)

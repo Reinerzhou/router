@@ -4,6 +4,7 @@ pub mod backend;
 pub mod config;
 pub mod logging;
 pub mod observability;
+#[cfg(feature = "python")]
 use std::collections::HashMap;
 
 pub mod core;
@@ -39,6 +40,7 @@ pub enum PolicyType {
     PowerOfTwo,
     ConsistentHash,
     StickyLeastLoaded,
+    StickyLeastLoadedRequests,
 }
 
 #[cfg(feature = "python")]
@@ -128,6 +130,7 @@ struct Router {
     enable_program_scheduling: bool,
     program_scheduling_config_json: Option<String>,
     // lmdeploy PD disaggregation
+    lmdeploy_backend: bool,
     lmdeploy_pd_disaggregation: bool,
     lmdeploy_migration_protocol: String,
     lmdeploy_rdma_link_type: String,
@@ -143,7 +146,8 @@ impl Router {
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
-        if self.vllm_pd_disaggregation && self.lmdeploy_pd_disaggregation {
+        if self.vllm_pd_disaggregation && (self.lmdeploy_pd_disaggregation || self.lmdeploy_backend)
+        {
             return Err(config::ConfigError::ValidationFailed {
                 reason:
                     "vllm_pd_disaggregation and lmdeploy_pd_disaggregation are mutually exclusive"
@@ -177,6 +181,9 @@ impl Router {
                     virtual_nodes: 160, // Default value
                 },
                 PolicyType::StickyLeastLoaded => ConfigPolicyConfig::StickyLeastLoaded,
+                PolicyType::StickyLeastLoadedRequests => {
+                    ConfigPolicyConfig::StickyLeastLoadedRequests
+                }
             }
         };
 
@@ -346,7 +353,7 @@ impl Router {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
-            lmdeploy_backend: self.lmdeploy_pd_disaggregation,
+            lmdeploy_backend: self.lmdeploy_backend || self.lmdeploy_pd_disaggregation,
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
@@ -457,6 +464,7 @@ impl Router {
         kv_event_block_size = 16,
         kv_event_model = None,
         // lmdeploy PD disaggregation defaults
+        lmdeploy_backend = false,
         lmdeploy_pd_disaggregation = false,
         lmdeploy_migration_protocol = String::from("rdma"),
         lmdeploy_rdma_link_type = String::from("roce"),
@@ -539,6 +547,7 @@ impl Router {
         kv_event_replay_source: Vec<String>,
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
+        lmdeploy_backend: bool,
         lmdeploy_pd_disaggregation: bool,
         lmdeploy_migration_protocol: String,
         lmdeploy_rdma_link_type: String,
@@ -635,6 +644,7 @@ impl Router {
             otlp_traces_endpoint,
             kv_connector,
             program_scheduling_config_json,
+            lmdeploy_backend,
             lmdeploy_pd_disaggregation,
             lmdeploy_migration_protocol,
             lmdeploy_rdma_link_type,

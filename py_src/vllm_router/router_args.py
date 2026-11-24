@@ -16,6 +16,12 @@ class RouterArgs:
     # PD-specific configuration
     mini_lb: bool = False
     vllm_pd_disaggregation: bool = False  # Enable vLLM PD disaggregated mode
+    lmdeploy_backend: bool = False
+    lmdeploy_pd_disaggregation: bool = False
+    lmdeploy_migration_protocol: str = "rdma"
+    lmdeploy_rdma_link_type: str = "roce"
+    lmdeploy_with_gdr: bool = True
+    lmdeploy_dummy_prefill: bool = False
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -157,6 +163,20 @@ class RouterArgs:
             help="JSON object overriding Program-level scheduling defaults (requires the enable flag)",
         )
 
+        parser.add_argument(f"--{prefix}lmdeploy-backend", action="store_true")
+        parser.add_argument(f"--{prefix}lmdeploy-pd-disaggregation", action="store_true")
+        parser.add_argument(
+            f"--{prefix}lmdeploy-migration-protocol", choices=["rdma", "nvlink"], default="rdma"
+        )
+        parser.add_argument(
+            f"--{prefix}lmdeploy-rdma-link-type", choices=["ib", "roce"], default="roce"
+        )
+        parser.add_argument(
+            f"--{prefix}lmdeploy-disable-gdr", action="store_false",
+            dest=f"{prefix.replace('-', '_')}lmdeploy_with_gdr", default=True
+        )
+        parser.add_argument(f"--{prefix}lmdeploy-dummy-prefill", action="store_true")
+
         # Routing policy configuration
         parser.add_argument(
             f"--{prefix}policy",
@@ -170,6 +190,7 @@ class RouterArgs:
                 "power_of_two",
                 "consistent_hash",
                 "sticky_least_loaded",
+                "sticky_least_loaded_requests",
             ],
             help="Load balancing policy to use. In PD mode, prefill and decode inherit this policy unless overridden",
         )
@@ -185,6 +206,7 @@ class RouterArgs:
                 "power_of_two",
                 "consistent_hash",
                 "sticky_least_loaded",
+                "sticky_least_loaded_requests",
             ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
@@ -200,6 +222,7 @@ class RouterArgs:
                 "power_of_two",
                 "consistent_hash",
                 "sticky_least_loaded",
+                "sticky_least_loaded_requests",
             ],
             help="Specific policy for decode nodes in PD mode. Defaults to --policy",
         )

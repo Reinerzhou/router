@@ -96,7 +96,7 @@ impl StickyLeastLoadedPolicy {
     pub fn new_requests() -> Self {
         let seconds = std::env::var("STICKY_LEAST_LOADED_SESSION_EXPIRATION_IN_S")
             .ok()
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DEFAULT_SESSION_EXPIRATION_SECS);
         let mut policy = Self::with_expiration_secs(seconds);
         policy.load_by_requests = true;
@@ -230,7 +230,17 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             .map(|&idx| (idx, workers[idx].url().to_string()))
             .collect();
 
-        let session_id = hash_key::extract_session_id(request_text, headers);
+        let session_id = if self.load_by_requests {
+            let filtered_headers = headers.map(|headers| {
+                let mut headers = headers.clone();
+                headers.remove("x-request-id");
+                headers.remove("x-trace-id");
+                headers
+            });
+            hash_key::extract_session_id_for_backend(request_text, filtered_headers.as_ref(), true)
+        } else {
+            hash_key::extract_session_id(request_text, headers)
+        };
         let now = Instant::now();
 
         let mut state = self.state.lock().unwrap();
@@ -331,6 +341,10 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         }
     }
 
+    fn tracks_request_load(&self) -> bool {
+        self.load_by_requests
+    }
+
     fn name(&self) -> &'static str {
         "sticky_least_loaded"
     }
@@ -380,6 +394,46 @@ mod tests {
         let mut headers: RequestHeaders = StdHashMap::new();
         headers.insert("x-session-id".to_string(), session_id.to_string());
         headers
+    }
+
+    #[test]
+    fn request_load_mode_keeps_sessions_but_places_by_inflight_load() {
+        let policy = StickyLeastLoadedPolicy::new_requests();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        workers[0].increment_load();
+        let first = policy
+            .select_worker_with_headers(&workers, None, Some(&header_with_session("first")))
+            .unwrap();
+        assert_eq!(first, 1);
+        workers[0].decrement_load();
+        workers[1].increment_load();
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, None, Some(&header_with_session("first"))),
+            Some(1)
+        );
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, None, Some(&header_with_session("second"))),
+            Some(0)
+        );
+        assert!(policy.tracks_request_load());
+        assert!(!StickyLeastLoadedPolicy::new().tracks_request_load());
+        // Selection does not itself reserve load: the Router guard owns that lifecycle.
+        assert_eq!(workers[0].load(), 0);
+        assert_eq!(workers[1].load(), 1);
+    }
+
+    #[test]
+    fn request_identifiers_do_not_create_sticky_sessions() {
+        let policy = StickyLeastLoadedPolicy::new_requests();
+        let workers = make_workers(&["http://w1:8000"]);
+        let mut headers = RequestHeaders::new();
+        headers.insert("x-request-id".into(), "request-only".into());
+        headers.insert("x-trace-id".into(), "trace-only".into());
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, None, Some(&headers)),
+            Some(0)
+        );
+        assert_eq!(policy.active_session_count(), 0);
     }
 
     #[test]

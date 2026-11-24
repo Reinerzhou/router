@@ -98,7 +98,7 @@ impl std::fmt::Display for Backend {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "lmdeploy-router")]
+#[command(name = env!("CARGO_BIN_NAME"))]
 #[command(version)]
 #[command(about = "VLLM Router - High-performance request distribution across worker nodes")]
 #[command(long_about = r#"
@@ -116,7 +116,7 @@ Examples:
   vllm-router --worker-urls grpc://worker1:50051
 
   # vLLM PD mode with pure service discovery (workers register themselves)
-  lmdeploy-router --vllm-pd-disaggregation \
+  vllm-router --vllm-pd-disaggregation \
     --vllm-discovery-address 0.0.0.0:30001 \
     --policy consistent_hash
 
@@ -274,9 +274,9 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     api_key_validation_urls: Vec<String>,
 
-    /// Backend to route requests to (vllm, trtllm, openai, anthropic)
-    #[arg(long, value_enum, default_value_t = Backend::default(), alias = "runtime")]
-    backend: Backend,
+    /// Backend (defaults to lmdeploy for lmdeploy-router, otherwise vllm)
+    #[arg(long, value_enum, alias = "runtime")]
+    backend: Option<Backend>,
     #[arg(long, value_parser = ["sessions", "requests"])]
     sticky_load_metric: Option<String>,
 
@@ -481,6 +481,16 @@ impl CliArgs {
         map
     }
 
+    fn effective_backend(&self) -> Backend {
+        self.backend.unwrap_or_else(|| {
+            if self.lmdeploy_pd_disaggregation {
+                Backend::Lmdeploy
+            } else {
+                Backend::default()
+            }
+        })
+    }
+
     /// Convert policy string to PolicyConfig
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
@@ -512,7 +522,7 @@ impl CliArgs {
                     .as_deref()
                     .map(|v| v == "requests")
                     .unwrap_or(
-                        matches!(self.backend, Backend::Lmdeploy)
+                        matches!(self.effective_backend(), Backend::Lmdeploy)
                             || self.lmdeploy_pd_disaggregation,
                     );
                 if requests {
@@ -541,10 +551,20 @@ impl CliArgs {
             self.kv_event_block_size,
             self.kv_event_model.as_deref(),
         )?;
-        if self.vllm_pd_disaggregation && self.lmdeploy_pd_disaggregation {
+        if self.vllm_pd_disaggregation
+            && (self.lmdeploy_pd_disaggregation
+                || matches!(self.effective_backend(), Backend::Lmdeploy))
+        {
             return Err(ConfigError::ValidationFailed {
                 reason: "--vllm-pd-disaggregation and --lmdeploy-pd-disaggregation are mutually exclusive"
                     .to_string(),
+            });
+        }
+
+        if self.lmdeploy_pd_disaggregation && !matches!(self.effective_backend(), Backend::Lmdeploy)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "--lmdeploy-pd-disaggregation requires the lmdeploy backend".to_string(),
             });
         }
 
@@ -554,7 +574,7 @@ impl CliArgs {
             RoutingMode::Regular {
                 worker_urls: vec![],
             }
-        } else if matches!(self.backend, Backend::Openai) {
+        } else if matches!(self.effective_backend(), Backend::Openai) {
             // OpenAI backend mode - use worker_urls as base(s)
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
@@ -778,7 +798,7 @@ impl CliArgs {
             enable_igw: self.enable_igw,
             rate_limit_tokens_per_second: None,
             lmdeploy_backend: self.lmdeploy_pd_disaggregation
-                || matches!(self.backend, Backend::Lmdeploy),
+                || matches!(self.effective_backend(), Backend::Lmdeploy),
             history_backend: match self.history_backend.as_str() {
                 "none" => HistoryBackend::None,
                 _ => HistoryBackend::Memory,
@@ -874,24 +894,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Host: {}:{}", cli_args.host, cli_args.port);
     let mode_str = if cli_args.enable_igw {
         "IGW (Inference Gateway)".to_string()
-    } else if matches!(cli_args.backend, Backend::Openai) {
+    } else if matches!(cli_args.effective_backend(), Backend::Openai) {
         "OpenAI Backend".to_string()
     } else if cli_args.vllm_pd_disaggregation {
         "vLLM PD Disaggregated".to_string()
     } else if cli_args.lmdeploy_pd_disaggregation {
         "LMDeploy PD Disaggregated".to_string()
     } else {
-        format!("Regular ({})", cli_args.backend)
+        format!("Regular ({})", cli_args.effective_backend())
     };
     println!("Mode: {}", mode_str);
 
     // Warn for runtimes that are parsed but not yet implemented
-    match cli_args.backend {
+    match cli_args.effective_backend() {
         Backend::Trtllm | Backend::Anthropic => {
             println!(
                 "WARNING: runtime '{}' not implemented yet; falling back to regular routing. \
 Provide --worker-urls or PD flags as usual.",
-                cli_args.backend
+                cli_args.effective_backend()
             );
         }
         Backend::Vllm | Backend::Lmdeploy | Backend::Openai => {}

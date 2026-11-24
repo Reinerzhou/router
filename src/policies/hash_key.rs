@@ -78,6 +78,14 @@ pub(crate) fn extract_session_id(
     request_text: Option<&str>,
     headers: Option<&RequestHeaders>,
 ) -> Option<String> {
+    extract_session_id_for_backend(request_text, headers, false)
+}
+
+pub(crate) fn extract_session_id_for_backend(
+    request_text: Option<&str>,
+    headers: Option<&RequestHeaders>,
+    lmdeploy: bool,
+) -> Option<String> {
     if let Some(hdrs) = headers {
         for header_name in SESSION_HEADER_NAMES {
             if let Some(value) = hdrs.get(*header_name) {
@@ -96,6 +104,11 @@ pub(crate) fn extract_session_id(
         .as_ref()
         .and_then(|params| params.get("session_id"));
     session_id_value(nested)
+        .or_else(|| {
+            lmdeploy
+                .then(|| session_id_value(fields.metadata.as_ref().and_then(|m| m.get("user_id"))))
+                .flatten()
+        })
         .or_else(|| session_id_value(fields.user.as_ref()))
         .or_else(|| session_id_value(fields.session_id.as_ref()))
         .or_else(|| session_id_value(fields.user_id.as_ref()))
@@ -104,6 +117,7 @@ pub(crate) fn extract_session_id(
 /// Top-level request body fields that can carry a session id.
 #[derive(Deserialize)]
 struct SessionIdFields {
+    metadata: Option<Value>,
     session_params: Option<Value>,
     user: Option<Value>,
     session_id: Option<Value>,

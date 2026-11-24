@@ -1493,6 +1493,11 @@ impl Router {
             ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
             _ => typed_req.extract_text_for_routing(),
         };
+        let text = if self.policy_for_model(model_id).name() == "sticky_least_loaded" {
+            serde_json::to_string(typed_req).unwrap_or(text)
+        } else {
+            text
+        };
         let text = &text;
         let prepared = &prepared;
         let completion = completion.as_ref();
@@ -1955,7 +1960,7 @@ impl Router {
             } else {
                 let request_url = format!("{}{}", worker_url, route);
                 (
-                    if self.lmdeploy_backend {
+                    if self.lmdeploy_backend && route == "/v1/chat/completions" {
                         let body = serde_json::to_value(typed_req)
                             .expect("serializable generation request");
                         self.client
@@ -5516,6 +5521,21 @@ mod tests {
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
             }));
+        router
+    }
+
+    fn create_test_sticky_router(urls: &[&str]) -> Router {
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::StickyLeastLoadedRequests,
+        ));
+        for url in urls {
+            router.worker_registry.register(Arc::new(BasicWorker::new(
+                url.to_string(),
+                WorkerType::Regular,
+            )));
+        }
         router
     }
 

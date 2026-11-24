@@ -811,6 +811,7 @@ mod test_pd_routing {
                 enable_igw: false,
                 rate_limit_tokens_per_second: None,
                 connection_mode: ConnectionMode::Http,
+                lmdeploy_backend: false,
                 history_backend: vllm_router_rs::config::HistoryBackend::Memory,
                 enable_profiling: false,
                 profile_timeout_secs: 30,

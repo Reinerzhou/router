@@ -77,12 +77,13 @@ async fn excluded_route_preserves_upstream_trace_and_sampling() {
             .iter()
             .find(|r| r.path == "/health_generate")
             .unwrap();
-        let received: Vec<_> = request.headers["traceparent"].split('-').collect();
+        assert_eq!(request.headers["traceparent"].len(), 1);
+        let received: Vec<_> = request.headers["traceparent"][0].split('-').collect();
         assert_eq!(received[1], trace);
         assert_eq!(received[3], flags);
         assert_eq!(
             request.headers["tracestate"],
-            "a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8"
+            vec!["a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8".to_owned()]
         );
         let spans = exporter.get_finished_spans().unwrap();
         if flags == "00" {

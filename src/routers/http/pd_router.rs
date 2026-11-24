@@ -8,6 +8,7 @@ use super::pd_types::{
 };
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs, HttpTokenInput};
 use crate::core::worker::WorkerMetadata;
+use crate::core::WorkerFactory;
 use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
     Worker, WorkerRegistry, WorkerResult, WorkerType,

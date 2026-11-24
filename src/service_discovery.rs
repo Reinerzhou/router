@@ -606,6 +606,21 @@ async fn remove_worker_from_router(
                     router.remove_worker(url);
                 }
             }
+        } else if let Some(lmdeploy) = router
+            .as_any()
+            .downcast_ref::<crate::routers::http::lmdeploy_pd_router::LMDeployPDRouter>(
+        ) {
+            let result = match pod_type {
+                Some(PodType::Prefill) => lmdeploy.remove_prefill_server(url).await.map(|_| ()),
+                Some(PodType::Decode) => lmdeploy.remove_decode_server(url).await.map(|_| ()),
+                _ => {
+                    router.remove_worker(url);
+                    Ok(())
+                }
+            };
+            if let Err(error) = result {
+                error!(url, %error, "Failed to remove LMDeploy worker");
+            }
         } else {
             // PD mode but not a VllmPDRouter, use generic removal
             router.remove_worker(url);

@@ -1,5 +1,8 @@
 # Router 支持 LMDeploy 推理与 PD 分离 — 编译与测试指南
 
+> Historical LMDeploy source-branch guide: its recorded test counts and build results do not
+> certify this migration. See `unified-router-migration.md` for the adapted interfaces.
+
 ## 目录
 
 1. [概述](#1-概述)

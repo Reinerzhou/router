@@ -46,6 +46,8 @@ pub fn stream_chunk(
         model: model.to_string(),
         system_fingerprint: None,
         choices: vec![ChatStreamChoice {
+            output_ids: None,
+            other: Default::default(),
             index: 0,
             delta: ChatMessageDelta {
                 role: include_role.then(|| "assistant".to_string()),
@@ -234,6 +236,8 @@ pub fn final_response(
         created,
         model: model.to_string(),
         choices: vec![ChatChoice {
+            output_ids: None,
+            other: Default::default(),
             index: 0,
             message: ChatMessage::Assistant {
                 role: "assistant".to_string(),

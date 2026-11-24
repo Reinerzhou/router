@@ -1136,8 +1136,13 @@ impl RouterTrait for LMDeployPDRouter {
                     .into_response()
             }
         };
-        self.process_lmd_request(headers, request_json, "/v1/chat/completions", model_id)
-            .await
+        self.process_lmd_request(
+            headers,
+            crate::protocols::lmdeploy::outbound(request_json, true),
+            "/v1/chat/completions",
+            model_id,
+        )
+        .await
     }
 
     async fn route_completion(
@@ -1261,6 +1266,14 @@ impl RouterTrait for LMDeployPDRouter {
             )
                 .into_response();
         }
+        let body = if path == "/v1/chat/completions" {
+            crate::protocols::lmdeploy::outbound(
+                crate::protocols::lmdeploy::inbound(body, true),
+                true,
+            )
+        } else {
+            body
+        };
         self.process_lmd_request(headers, body, path, None).await
     }
 }

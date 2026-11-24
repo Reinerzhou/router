@@ -661,6 +661,17 @@ impl ChatCompletionRequest {
 
 impl GenerationRequest for ChatCompletionRequest {
     fn extract_cache_routing_key(&self) -> String {
+        // LMDeploy token input must retain the upstream token namespace, even
+        // when conservative text affinity is enabled.
+        if let Some(ids) = &self.input_ids {
+            return cache_routing::session(
+                self.session_params
+                    .as_ref()
+                    .and_then(|p| p.get("session_id"))
+                    .and_then(Value::as_str),
+            )
+            .unwrap_or_else(|| cache_routing::tokens(ids));
+        }
         if crate::protocols::routing_text::enabled() {
             if let Ok(body) = serde_json::to_value(self) {
                 return cache_routing::text(&crate::protocols::routing_text::conservative_key(
@@ -691,8 +702,15 @@ impl GenerationRequest for ChatCompletionRequest {
             .and_then(|params| params.get("session_id"))
             .and_then(Value::as_str)
             .filter(|session_id| !session_id.trim().is_empty())
-            .unwrap_or_default()
-            .to_string()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                self.input_ids.as_ref().map_or_else(String::new, |ids| {
+                    ids.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+            })
     }
 
     fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
@@ -3427,6 +3445,14 @@ mod tests {
         });
         let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
         assert_eq!(req.extract_text_for_routing(), "151644 8948 198 2610");
+        assert_eq!(
+            req.extract_cache_routing_key(),
+            cache_routing::tokens(&[151644, 8948, 198, 2610])
+        );
+        assert_ne!(
+            req.extract_cache_routing_key(),
+            cache_routing::text("151644 8948 198 2610")
+        );
     }
 
     #[test]
@@ -5285,6 +5311,14 @@ mod tests {
         let req: ChatCompletionRequest =
             serde_json::from_value(body).expect("deserialize chat request");
         assert_eq!(req.extract_text_for_routing(), "151644 8948 198 2610");
+        assert_eq!(
+            req.extract_cache_routing_key(),
+            cache_routing::tokens(&[151644, 8948, 198, 2610])
+        );
+        assert_ne!(
+            req.extract_cache_routing_key(),
+            cache_routing::text("151644 8948 198 2610")
+        );
     }
 
     #[test]
@@ -5299,6 +5333,10 @@ mod tests {
         let req: ChatCompletionRequest =
             serde_json::from_value(body).expect("deserialize chat request");
         assert_eq!(req.extract_text_for_routing(), "sess-abc");
+        assert_eq!(
+            req.extract_cache_routing_key(),
+            cache_routing::session(Some("sess-abc")).unwrap()
+        );
     }
 
     #[test]

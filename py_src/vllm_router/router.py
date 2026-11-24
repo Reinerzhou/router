@@ -17,6 +17,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "power_of_two": PolicyType.PowerOfTwo,
         "consistent_hash": PolicyType.ConsistentHash,
         "sticky_least_loaded": PolicyType.StickyLeastLoaded,
+        "sticky_least_loaded_requests": PolicyType.StickyLeastLoadedRequests,
     }
     return policy_map[policy_str]
 
@@ -127,18 +128,18 @@ class Router:
 
         args_dict = vars(args)
         # Convert RouterArgs to _Router parameters
+        pd_mode = args_dict["vllm_pd_disaggregation"] or args_dict["lmdeploy_pd_disaggregation"]
         args_dict["worker_urls"] = (
-            []
-            if args_dict["service_discovery"] or args_dict["vllm_pd_disaggregation"]
-            else args_dict["worker_urls"]
+            [] if args_dict["service_discovery"] or pd_mode else args_dict["worker_urls"]
         )
-        args_dict["policy"] = policy_from_str(args_dict["policy"])
-        args_dict["prefill_urls"] = (
-            args_dict["prefill_urls"] if args_dict["vllm_pd_disaggregation"] else None
-        )
-        args_dict["decode_urls"] = (
-            args_dict["decode_urls"] if args_dict["vllm_pd_disaggregation"] else None
-        )
+        policy = args_dict["policy"]
+        if policy == "sticky_least_loaded" and (
+            args_dict["lmdeploy_backend"] or args_dict["lmdeploy_pd_disaggregation"]
+        ):
+            policy = "sticky_least_loaded_requests"
+        args_dict["policy"] = policy_from_str(policy)
+        args_dict["prefill_urls"] = args_dict["prefill_urls"] if pd_mode else None
+        args_dict["decode_urls"] = args_dict["decode_urls"] if pd_mode else None
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
 

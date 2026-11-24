@@ -32,7 +32,7 @@ use axum::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
@@ -344,16 +344,29 @@ async fn inference_generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    body: Result<Json<ChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let body = match body {
         Ok(Json(body)) => body,
         Err(rejection) => return openai_json_rejection(rejection),
     };
+
+    let body = crate::protocols::lmdeploy::inbound(
+        body,
+        state.context.router_config.is_lmdeploy_backend(),
+    );
+    let body: ChatCompletionRequest =
+        match serde_json::from_value(body) {
+            Ok(body) => body,
+            Err(error) => return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"type":"invalid_request_error","message":error.to_string()}})),
+            )
+                .into_response(),
+        };
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
-
     state.router.route_chat(Some(&headers), &body, None).await
 }
 
@@ -1646,7 +1659,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn completion_extractor_matches_locked_axum_json() {
+    async fn completion_extractor_preserves_raw_json_and_normalizes_validation_errors() {
         use axum::body::{to_bytes, Body, Bytes};
 
         async fn assert_parity(content_type: Option<http::HeaderValue>, raw: &'static str) {
@@ -1671,7 +1684,7 @@ mod tests {
                     assert_eq!(actual.raw, Bytes::copy_from_slice(raw.as_bytes()));
                 }
                 (Err(actual), Err(expected)) => {
-                    let expected = expected.into_response();
+                    let expected = openai_json_rejection(expected);
                     assert_eq!(
                         actual.status(),
                         expected.status(),
@@ -1821,7 +1834,7 @@ mod tests {
             (r#"{"prompt":"#, StatusCode::BAD_REQUEST, false),
             (
                 r#"{"prompt":[1],"prompt":[2]}"#,
-                StatusCode::UNPROCESSABLE_ENTITY,
+                StatusCode::BAD_REQUEST,
                 false,
             ),
         ] {
@@ -1863,7 +1876,7 @@ mod tests {
             .await
             .expect("invalid header must not wait for an unfinished body")
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(polls.load(Ordering::Relaxed), 0);
         for (body, status) in [
             (Body::from(" ".repeat(129)), StatusCode::PAYLOAD_TOO_LARGE),

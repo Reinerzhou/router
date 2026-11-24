@@ -67,6 +67,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         health_check: vllm_router_rs::config::HealthCheckConfig::default(),
         enable_igw: false,
         connection_mode: ConnectionMode::Http,
+        lmdeploy_backend: false,
         history_backend: HistoryBackend::Memory,
         enable_profiling: false,
         profile_timeout_secs: 10,

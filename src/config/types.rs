@@ -1155,6 +1155,7 @@ pub enum PolicyConfig {
     /// `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` environment variable.
     #[serde(rename = "sticky_least_loaded")]
     StickyLeastLoaded,
+    #[serde(rename = "sticky_least_loaded_requests")]
     StickyLeastLoadedRequests,
 
     #[serde(rename = "rendezvous_hash")]
@@ -1441,6 +1442,10 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    pub fn is_lmdeploy_backend(&self) -> bool {
+        self.lmdeploy_backend || matches!(self.mode, RoutingMode::LMDeployPrefillDecode { .. })
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
