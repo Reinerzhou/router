@@ -955,6 +955,14 @@ pub fn build_app_with_wasm_middleware(
             max_payload_size,
         ));
 
+    // Register fallback before shared observation/trace layers: /v1/messages
+    // reaches the transparent proxy and must share the same request lifecycle.
+    let base_app = if enable_transparent_proxy {
+        base_app.fallback(transparent_proxy_handler)
+    } else {
+        base_app.fallback(sink_handler)
+    };
+
     let base_app = if enable_request_tracing {
         base_app.layer(middleware::create_logging_layer())
     } else {
@@ -968,14 +976,7 @@ pub fn build_app_with_wasm_middleware(
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins));
 
-    // Choose fallback based on transparent proxy mode
-    if enable_transparent_proxy {
-        base_app
-            .fallback(transparent_proxy_handler)
-            .with_state(app_state)
-    } else {
-        base_app.fallback(sink_handler).with_state(app_state)
-    }
+    base_app.with_state(app_state)
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {

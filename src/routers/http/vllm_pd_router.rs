@@ -1936,6 +1936,7 @@ impl VllmPDRouter {
             Ok(resp) => resp,
             Err(e) => {
                 attempt.finish_decode();
+                self.stop_profiling(&decode_base_url).await;
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
