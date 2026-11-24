@@ -189,7 +189,29 @@ mod tests {
     fn chat_key(messages: Value) -> String {
         let request: ChatCompletionRequest =
             serde_json::from_value(serde_json::json!({"messages": messages})).unwrap();
-        request.extract_text_for_routing()
+        conservative_key(&serde_json::to_value(request).unwrap(), "messages")
+    }
+
+    #[test]
+    fn content_affinity_switch_preserves_upstream_session_default() {
+        let body = serde_json::json!({
+            "messages": [{"role":"user", "content":"hello"}],
+            "session_params": {"session_id":"session-a"}
+        });
+        let request: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        let expected = if enabled() {
+            crate::protocols::spec::cache_routing::text(&conservative_key(
+                &serde_json::to_value(&request).unwrap(),
+                "messages",
+            ))
+        } else {
+            crate::protocols::spec::cache_routing::session(Some("session-a")).unwrap()
+        };
+        assert_eq!(request.extract_cache_routing_key(), expected);
+        assert_eq!(
+            crate::protocols::spec::cache_routing::for_route(&body, "/v1/chat/completions",),
+            expected
+        );
     }
 
     #[test]
@@ -281,7 +303,7 @@ mod tests {
 
         let extract = |body: Value| {
             let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-            request.extract_text_for_routing()
+            conservative_key(&serde_json::to_value(request).unwrap(), "messages")
         };
         let first_key = extract(first);
         assert_eq!(first_key, extract(second));
