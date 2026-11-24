@@ -346,6 +346,7 @@ impl Router {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
+            lmdeploy_backend: self.lmdeploy_pd_disaggregation,
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout

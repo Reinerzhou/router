@@ -56,6 +56,8 @@ fn split_prefill_args_from_others(
 pub enum Backend {
     #[value(name = "vllm")]
     Vllm,
+    #[value(name = "lmdeploy")]
+    Lmdeploy,
     #[value(name = "trtllm")]
     Trtllm,
     #[value(name = "openai")]
@@ -64,10 +66,29 @@ pub enum Backend {
     Anthropic,
 }
 
+impl Default for Backend {
+    fn default() -> Self {
+        if std::env::args()
+            .next()
+            .and_then(|s| {
+                std::path::Path::new(&s)
+                    .file_name()
+                    .map(|v| v.to_string_lossy().into_owned())
+            })
+            .is_some_and(|s| s == "lmdeploy-router")
+        {
+            Self::Lmdeploy
+        } else {
+            Self::Vllm
+        }
+    }
+}
+
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Backend::Vllm => "vllm",
+            Backend::Lmdeploy => "lmdeploy",
             Backend::Trtllm => "trtllm",
             Backend::Openai => "openai",
             Backend::Anthropic => "anthropic",
@@ -254,7 +275,7 @@ struct CliArgs {
     api_key_validation_urls: Vec<String>,
 
     /// Backend to route requests to (vllm, trtllm, openai, anthropic)
-    #[arg(long, value_enum, default_value_t = Backend::Vllm, alias = "runtime")]
+    #[arg(long, value_enum, default_value_t = Backend::default(), alias = "runtime")]
     backend: Backend,
 
     /// Native framework log directory, independent of OBSERVABILITY_LOG_DIR
@@ -740,6 +761,8 @@ impl CliArgs {
             },
             enable_igw: self.enable_igw,
             rate_limit_tokens_per_second: None,
+            lmdeploy_backend: self.lmdeploy_pd_disaggregation
+                || matches!(self.backend, Backend::Lmdeploy),
             history_backend: match self.history_backend.as_str() {
                 "none" => HistoryBackend::None,
                 _ => HistoryBackend::Memory,
@@ -855,7 +878,7 @@ Provide --worker-urls or PD flags as usual.",
                 cli_args.backend
             );
         }
-        Backend::Vllm | Backend::Openai => {}
+        Backend::Vllm | Backend::Lmdeploy | Backend::Openai => {}
     }
 
     if !cli_args.enable_igw {

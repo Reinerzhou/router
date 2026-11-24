@@ -279,6 +279,7 @@ struct SelectedWorker {
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
+    lmdeploy_backend: bool,
     epd: Option<super::epd::EncoderStage>,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
@@ -596,6 +597,7 @@ impl Router {
         });
 
         Ok(Router {
+            lmdeploy_backend: ctx.router_config.lmdeploy_backend,
             epd: ctx
                 .router_config
                 .epd
@@ -1941,7 +1943,8 @@ impl Router {
                     }
                 };
 
-                // Use the original json_val without modification
+                let json_val =
+                    crate::protocols::lmdeploy::outbound(json_val, self.lmdeploy_backend);
 
                 let request_url = format!("{}{}", worker_url_prefix, route);
                 (
@@ -1952,7 +1955,13 @@ impl Router {
             } else {
                 let request_url = format!("{}{}", worker_url, route);
                 (
-                    if let Some(completion) = completion {
+                    if self.lmdeploy_backend {
+                        let body = serde_json::to_value(typed_req)
+                            .expect("serializable generation request");
+                        self.client
+                            .post(&request_url)
+                            .json(&crate::protocols::lmdeploy::outbound(body, true))
+                    } else if let Some(completion) = completion {
                         completion.forward_request(&self.client, &request_url, headers, typed_req)
                     } else {
                         self.client.post(&request_url).json(typed_req)
@@ -5410,6 +5419,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            lmdeploy_backend: false,
             epd: None,
             worker_registry,
             policy_registry,
@@ -5445,6 +5455,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            lmdeploy_backend: false,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -6885,6 +6896,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            lmdeploy_backend: false,
             worker_registry,
             policy_registry,
             epd: None,
