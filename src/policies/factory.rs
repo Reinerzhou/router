@@ -71,6 +71,9 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
+            PolicyConfig::StickyLeastLoadedRequests => {
+                Arc::new(StickyLeastLoadedPolicy::new_requests())
+            }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }

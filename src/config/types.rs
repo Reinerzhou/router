@@ -1155,6 +1155,7 @@ pub enum PolicyConfig {
     /// `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` environment variable.
     #[serde(rename = "sticky_least_loaded")]
     StickyLeastLoaded,
+    StickyLeastLoadedRequests,
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
@@ -1191,6 +1192,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::StickyLeastLoaded => "sticky_least_loaded",
+            PolicyConfig::StickyLeastLoadedRequests => "sticky_least_loaded_requests",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }

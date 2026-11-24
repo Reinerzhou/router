@@ -20,7 +20,9 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{rejection::JsonRejection, DefaultBodyLimit, FromRequest, Path, Query, Request, State},
+    extract::{
+        rejection::JsonRejection, DefaultBodyLimit, FromRequest, Path, Query, Request, State,
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -415,7 +417,9 @@ where
                         || value.suffix().is_some_and(|suffix| suffix == "json"))
             });
         if !json_content_type {
-            return Err(openai_json_rejection(axum::extract::rejection::MissingJsonContentType::default().into()));
+            return Err(openai_json_rejection(
+                axum::extract::rejection::MissingJsonContentType::default().into(),
+            ));
         }
         let raw = axum::body::Bytes::from_request(request, state)
             .await

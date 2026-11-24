@@ -277,6 +277,8 @@ struct CliArgs {
     /// Backend to route requests to (vllm, trtllm, openai, anthropic)
     #[arg(long, value_enum, default_value_t = Backend::default(), alias = "runtime")]
     backend: Backend,
+    #[arg(long, value_parser = ["sessions", "requests"])]
+    sticky_load_metric: Option<String>,
 
     /// Native framework log directory, independent of OBSERVABILITY_LOG_DIR
     #[arg(long)]
@@ -504,7 +506,21 @@ impl CliArgs {
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
             },
-            "sticky_least_loaded" => PolicyConfig::StickyLeastLoaded,
+            "sticky_least_loaded" => {
+                let requests = self
+                    .sticky_load_metric
+                    .as_deref()
+                    .map(|v| v == "requests")
+                    .unwrap_or(
+                        matches!(self.backend, Backend::Lmdeploy)
+                            || self.lmdeploy_pd_disaggregation,
+                    );
+                if requests {
+                    PolicyConfig::StickyLeastLoadedRequests
+                } else {
+                    PolicyConfig::StickyLeastLoaded
+                }
+            }
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
             _ => PolicyConfig::RoundRobin, // Fallback
         }

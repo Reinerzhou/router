@@ -357,3 +357,13 @@ strip = true
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+[[test]]
+name = "lmdeploy_registration_test"
+path = "tests/rust/lmdeploy_registration_test.rs"
+required-features = ["cpu", "ready"]
+
+[[test]]
+name = "otel_excluded_route_test"
+path = "tests/rust/otel_excluded_route_test.rs"
+required-features = ["cpu", "ready"]

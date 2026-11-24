@@ -70,6 +70,7 @@ struct SllState {
 pub struct StickyLeastLoadedPolicy {
     state: Mutex<SllState>,
     session_expiration: Duration,
+    load_by_requests: bool,
 }
 
 impl StickyLeastLoadedPolicy {
@@ -88,7 +89,18 @@ impl StickyLeastLoadedPolicy {
                 last_sweep: Instant::now(),
             }),
             session_expiration: Duration::from_secs(secs),
+            load_by_requests: false,
         }
+    }
+
+    pub fn new_requests() -> Self {
+        let seconds = std::env::var("STICKY_LEAST_LOADED_SESSION_EXPIRATION_IN_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SESSION_EXPIRATION_SECS);
+        let mut policy = Self::with_expiration_secs(seconds);
+        policy.load_by_requests = true;
+        policy
     }
 
     fn expiration_secs_from_env() -> u64 {
@@ -223,13 +235,21 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
 
         let mut state = self.state.lock().unwrap();
         Self::sweep_expired(&mut state, self.session_expiration, now);
+        let placement_loads = if self.load_by_requests {
+            workers
+                .iter()
+                .map(|worker| (worker.url().to_string(), worker.load()))
+                .collect()
+        } else {
+            state.active_counts.clone()
+        };
 
         // Requests without a session id: load-balance but don't record state.
         let session_id = match session_id {
             Some(id) => id,
             None => {
                 let tie_break = request_text.unwrap_or("");
-                let idx = Self::select_least_loaded(&state.active_counts, &candidates, tie_break);
+                let idx = Self::select_least_loaded(&placement_loads, &candidates, tie_break);
                 drop(state);
                 self.record_selection(&workers[idx]);
                 debug!("SLL: stateless request routed to '{}'", workers[idx].url());
@@ -277,7 +297,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         }
 
         // New session: assign to least-loaded replica (tie-broken by hashing).
-        let idx = Self::select_least_loaded(&state.active_counts, &candidates, &session_id);
+        let idx = Self::select_least_loaded(&placement_loads, &candidates, &session_id);
         let worker_url = workers[idx].url().to_string();
         state.sessions.insert(
             session_id.clone(),
