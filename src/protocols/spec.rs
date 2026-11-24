@@ -658,7 +658,9 @@ impl GenerationRequest for ChatCompletionRequest {
     fn extract_cache_routing_key(&self) -> String {
         if crate::protocols::routing_text::enabled() {
             if let Ok(body) = serde_json::to_value(self) {
-                return cache_routing::text(&crate::protocols::routing_text::conservative_key(&body, "messages"));
+                return cache_routing::text(&crate::protocols::routing_text::conservative_key(
+                    &body, "messages",
+                ));
             }
         }
         cache_routing::session(
@@ -2865,7 +2867,8 @@ pub(crate) mod cache_routing {
     /// another API (for example a chat request with a `prompt` extension).
     pub fn for_route(body: &Value, route: &str) -> String {
         if crate::protocols::routing_text::enabled() {
-            if let Some(key) = crate::protocols::routing_text::transparent_routing_text(route, body) {
+            if let Some(key) = crate::protocols::routing_text::transparent_routing_text(route, body)
+            {
                 return text(&key);
             }
         }
