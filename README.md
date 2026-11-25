@@ -5,6 +5,9 @@
 
 A high-performance and light-weight request forwarding system for vLLM large scale deployments, providing advanced load balancing methods and prefill/decode disaggregation support.
 
+For this branch's vLLM/LMDeploy entrypoints, patch provenance and packaging, see the
+[v0.1.17 migration guide](docs/unified-router-migration.md).
+
 ### Key Features
 
 - **Core Architecture**: Request routing framework and async processing patterns

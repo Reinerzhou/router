@@ -94,3 +94,19 @@ This command checks native Linux packaging only. A formal release still needs an
 in the supported manylinux environment, its compatibility audit, and backend acceptance testing.
 The candidate package version is independent of the Rust baseline; do not publish it as an existing
 LMDeploy release. Only the `lmdeploy-router` executable belongs in this wheel.
+
+## Validation results
+
+| Check | Result |
+| --- | --- |
+| Compilation | All-target interface check with `cpu,ready`; both executable entrypoints built. |
+| Focused library regression | 318 tests passed across protocols, sticky/hash, configuration, P/D, errors and observation. |
+| HTTP integration | 17 tests passed: registration (2), excluded tracing (1), full tracing (1), request formats (7), API errors (6). |
+| Actual executable smoke | Both default backends, both explicit overrides, LMDeploy P/D mock, and both KV-aware raw-completion paths passed. |
+| Inherited vLLM checks | 4 checksum/error tests, 12 native-observation requests, and 14 multi-endpoint requests passed. |
+| Candidate wheel | Native Linux dev wheel rebuilt after the tracing fix; sole LMDeploy binary, Python 3.13.5 reinstall and installed HTTP smoke passed. |
+
+The tracing regression exercises transparent `/v1/messages` with a query string. Its fixed route
+name is recorded without including the query or arbitrary unmatched paths, and LMDeploy retains
+its `model.router` span name. Backend request counts in the observation checks remain 24 and 28;
+the router does not generate extra inference probes.
