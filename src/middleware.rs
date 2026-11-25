@@ -155,7 +155,11 @@ impl<B> MakeSpan<B> for RequestSpan {
         let route = request
             .extensions()
             .get::<axum::extract::MatchedPath>()
-            .map(axum::extract::MatchedPath::as_str);
+            .map(axum::extract::MatchedPath::as_str)
+            // Axum does not set MatchedPath for the transparent fallback.
+            // Recognize only this fixed protocol endpoint; arbitrary fallback
+            // paths and query strings must not become trace metadata.
+            .or_else(|| (request_path == "/v1/messages").then_some("/v1/messages"));
         let lmdeploy = crate::otel_trace::is_lmdeploy_router();
         let span = info_span!(
             target: "otel_trace",
